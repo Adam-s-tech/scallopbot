@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import type { Logger } from 'pino';
 import type { Config } from '../config/config.js';
 import { PurposeRouter, DEFAULT_MODELS, type ModelPurpose } from '../config/model-routing.js';
@@ -16,6 +17,8 @@ import {
 import { defineSkill } from '../skills/sdk.js';
 import { SessionManager } from '../agent/session.js';
 import { Agent } from '../agent/agent.js';
+import { initSecurityLayers } from '../security/startup.js';
+import { vaultLoadResult } from '../config/config.js';
 import { EvolutionRecorder } from '../evolution/signals.js';
 import { EvolutionEngine } from '../evolution/engine.js';
 import { createLoadProcedureSkill } from '../evolution/procedure-skill.js';
@@ -23,18 +26,20 @@ import { SkillStore } from '../evolution/skill-store.js';
 import { TelegramChannel } from '../channels/telegram.js';
 import { TelegramGateway } from '../channels/telegram-gateway.js';
 import { ApiChannel } from '../channels/api.js';
+import type { ProactiveChatChannel } from '../channels/chat-support.js';
+import { configuredChatChannels, startChatChannels } from './chat-channels.js';
 import { createSkillRegistry, type SkillRegistry } from '../skills/registry.js';
 import { createSkillExecutor, type SkillExecutor } from '../skills/executor.js';
 import { Router, buildTierMapping } from '../routing/router.js';
 import { CostTracker } from '../routing/cost.js';
 import {
   BackgroundGardener,
-  OllamaEmbedder,
   LLMFactExtractor,
   SessionSummarizer,
   ScallopMemoryStore,
   type EmbeddingProvider,
 } from '../memory/index.js';
+import { createConfiguredEmbedder } from '../memory/embedding-config.js';
 import { ContextManager } from '../routing/context.js';
 import { MediaProcessor } from '../media/index.js';
 import { VoiceManager } from '../voice/index.js';
@@ -61,6 +66,7 @@ import { matchesPolicy } from '../skills/tool-policy.js';
 import { resolveStateUserId, resolveStateUserTimezone } from '../utils/state-user-id.js';
 import { inspectArtifact, validateArtifactForDelivery } from '../artifacts/delivery.js';
 import { OutcomeBrain } from '../brain/index.js';
+import { registerMediaSkills, type MediaSkills } from '../skills/media-skills.js';
 
 export interface GatewayOptions {
   config: Config;
@@ -91,6 +97,8 @@ export class Gateway {
   private agent: Agent | null = null;
   private telegramChannel: TelegramChannel | null = null;
   private apiChannel: ApiChannel | null = null;
+  /** Discord, Slack, WhatsApp, Signal, Matrix: whichever are configured and started */
+  private chatChannels: ProactiveChatChannel[] = [];
   private unifiedScheduler: UnifiedScheduler | null = null;
   private subAgentRegistry: SubAgentRegistry | null = null;
   private subAgentExecutor: SubAgentExecutor | null = null;
@@ -98,7 +106,10 @@ export class Gateway {
   private interruptQueue: InterruptQueue | null = null;
   private outboundQueue: OutboundQueue | null = null;
   private outcomeBrain: OutcomeBrain | null = null;
+  private mediaSkills: MediaSkills | null = null;
   private subAgentDeliveryTimer: NodeJS.Timeout | null = null;
+  /** Opt-in email inbox trigger + calendar heads-up (src/triggers/mail-calendar.ts). */
+  private mailCalendarTriggers: { stop(): void } | null = null;
   /** Explicit aliases for this deployment's single canonical state owner. */
   private canonicalSingleUserIds: string[] = [];
 
@@ -150,6 +161,7 @@ export class Gateway {
     }
 
     this.logger.info('Initializing gateway...');
+    initSecurityLayers(this.logger, vaultLoadResult);
     this.configureLifecycleEventRelay();
 
     // A single configured Telegram owner may safely share the canonical
@@ -188,16 +200,14 @@ export class Gateway {
       this.logger,
     );
 
-    // Use OllamaEmbedder for semantic search if Ollama is configured
-    let embedder: EmbeddingProvider | undefined;
-    const ollamaConfig = this.config.providers.ollama;
-    if (ollamaConfig.baseUrl) {
-      embedder = new OllamaEmbedder({
-        baseUrl: ollamaConfig.baseUrl,
-        model: 'nomic-embed-text',  // Use nomic-embed-text for embeddings
-      });
-      this.logger.debug({ model: 'nomic-embed-text', baseUrl: ollamaConfig.baseUrl }, 'Using Ollama for semantic embeddings');
-    }
+    // Memory embeddings: EMBEDDING_PROVIDER=tfidf|openai|ollama (unset = try
+    // Ollama, else TF-IDF). Fixed for this process; vectors are tagged per model.
+    const embeddingSetup = await createConfiguredEmbedder({
+      ollamaBaseUrl: this.config.providers.ollama.baseUrl,
+      openaiApiKey: this.config.providers.openai.apiKey || undefined,
+      logger: this.logger,
+    });
+    const embedder: EmbeddingProvider | undefined = embeddingSetup.embedder;
 
     // Initialize memory system — ScallopMemory (SQLite) is always the primary backend.
     // If MEMORY_DB_PATH is absolute, use it as-is (lets workspace and DB be decoupled
@@ -219,6 +229,7 @@ export class Gateway {
       dbPath,
       logger: this.logger,
       embedder,
+      embeddingModel: embeddingSetup.key,
       rerankProvider,
       relationsProvider: rerankProvider,
       mmrEnabled: this.config.memory.mmrEnabled,
@@ -273,7 +284,13 @@ export class Gateway {
     }
 
     // Backfill embeddings for old memories (runs in background, non-blocking)
-    this.scallopMemoryStore.backfillEmbeddings({ batchSize: 20, limit: 500 }).then(count => {
+    // Vectors from another embedding model are re-embedded too, unless this run
+    // is on the TF-IDF fallback (they will be picked up once Ollama is back).
+    this.scallopMemoryStore.backfillEmbeddings({
+      batchSize: 20,
+      limit: 500,
+      includeStale: !embeddingSetup.fellBack,
+    }).then(count => {
       if (count > 0) {
         this.logger.info({ embeddingsBackfilled: count }, 'Embedding backfill completed');
       }
@@ -441,6 +458,18 @@ export class Gateway {
 
     // Register native skills (comms + memory_get) that need runtime access
     this.registerNativeSkills(voiceStatus.tts);
+    // image_gen / phone_call / sms: bundled SKILL.md, in-process handlers
+    const mediaVoice = voiceStatus.tts ? this.voiceManager : null;
+    this.mediaSkills = registerMediaSkills({
+      registry: this.skillRegistry,
+      logger: this.logger,
+      costTracker: this.costTracker ?? undefined,
+      deliverFile: (userId, filePath, caption, ctx) =>
+        this.handleFileSend(userId, filePath, caption, ctx.sessionId, ctx.userMessage),
+      getApprovals: () => this.agent?.getApprovalStore(),
+      notify: (userId, text) => this.handleProactiveMessage(userId, text),
+      synthesize: mediaVoice ? (text) => mediaVoice.synthesize(text, { format: 'mp3' }) : undefined,
+    });
     this.logger.debug(
       { nativeSkills: ['send_message', 'send_file', 'inspect_artifact', 'voice_reply', 'memory_get', 'load_procedure'].filter(n => this.skillRegistry!.hasSkill(n)) },
       'Native skills registered'
@@ -673,7 +702,9 @@ export class Gateway {
         subAgentExecutor: this.subAgentExecutor || undefined,
         router: this.router || undefined,
         interval: 30 * 1000, // Check every 30 seconds
-        onSendMessage: this.outboundQueue.createHandler(),
+        onSendMessage: this.mediaSkills
+          ? this.mediaSkills.withReminderCalls(this.outboundQueue.createHandler())
+          : this.outboundQueue.createHandler(),
         getTimezone: (userId: string) => this.getUserTimezone(userId),
         canonicalSingleUserIds: this.canonicalSingleUserIds,
       });
@@ -868,13 +899,34 @@ export class Gateway {
       this.registerTelegramTriggerSource(this.telegramChannel);
     }
 
+    // Start the other chat channels that have credentials. Each failure is
+    // logged inside startChatChannels and never aborts gateway startup.
+    this.chatChannels = await startChatChannels(
+      configuredChatChannels(this.config.channels, {
+        agent: this.agent!,
+        sessionManager: this.sessionManager!,
+        logger: this.logger,
+        db: this.scallopMemoryStore?.getDatabase(),
+        voiceManager: this.voiceManager || undefined,
+        onUserMessage: (prefixedUserId: string, userMessage?: string) =>
+          this.unifiedScheduler?.checkEngagement(prefixedUserId, userMessage),
+      }),
+      this.logger,
+    );
+    for (const channel of this.chatChannels) {
+      this.registerChatTriggerSource(channel);
+    }
+
     // Start API channel if enabled (web UI)
     if (this.config.channels.api.enabled) {
       this.apiChannel = new ApiChannel({
         port: this.config.channels.api.port,
         host: this.config.channels.api.host,
         apiKey: this.config.channels.api.apiKey,
-        staticDir: path.join(process.cwd(), 'public'),
+        // Resolve the built dashboard relative to the package (src/ or dist/ →
+        // ../../public) so it is found under `npm install -g` and in Docker,
+        // not only when started from the repo root.
+        staticDir: fileURLToPath(new URL('../../public', import.meta.url)),
         agent: this.agent!,
         sessionManager: this.sessionManager!,
         logger: this.logger,
@@ -889,6 +941,8 @@ export class Gateway {
         providerRegistry: this.providerRegistry || undefined,
         subAgentRegistry: this.subAgentRegistry || undefined,
         subAgentExecutor: this.subAgentExecutor || undefined,
+        twilioWebhook: this.mediaSkills?.twilioWebhook,
+        voiceManager: this.voiceManager || undefined,
       });
       await this.apiChannel.start();
 
@@ -926,6 +980,16 @@ export class Gateway {
       void this.drainSubAgentDeliveriesSafely();
     }, 1_000);
 
+    // Email inbox trigger and calendar heads-up; both off unless configured.
+    const { startMailAndCalendarTriggers } = await import('../triggers/mail-calendar.js');
+    this.mailCalendarTriggers = startMailAndCalendarTriggers({
+      agent: this.agent!,
+      sessionManager: this.sessionManager!,
+      logger: this.logger,
+      notifyOwner: (text) => this.handleProactiveMessage('default', text),
+      ownerTimeZone: () => this.getUserTimezone('default'),
+    });
+
     this.isRunning = true;
     this.logger.info('Gateway started');
   }
@@ -961,6 +1025,16 @@ export class Gateway {
     this.logger.debug('Registered telegram trigger source');
   }
 
+  /** Register a started chat channel for reminders and proactive delivery. */
+  private registerChatTriggerSource(channel: ProactiveChatChannel): void {
+    this.triggerSources.set(channel.name, {
+      sendMessage: (userId: string, message: string) => channel.sendMessage(userId, message),
+      sendFile: (userId: string, filePath: string, caption?: string) => channel.sendFile(userId, filePath, caption),
+      getName: () => channel.name,
+    });
+    this.logger.debug({ channel: channel.name }, 'Registered chat trigger source');
+  }
+
   async stop(): Promise<void> {
     if (!this.isRunning) {
       return;
@@ -989,6 +1063,9 @@ export class Gateway {
       this.subAgentDeliveryTimer = null;
     }
 
+    this.mailCalendarTriggers?.stop();
+    this.mailCalendarTriggers = null;
+
     // Clear trigger sources before stopping channels
     this.triggerSources.clear();
 
@@ -997,6 +1074,16 @@ export class Gateway {
       await this.apiChannel.stop();
       this.apiChannel = null;
     }
+
+    // Stop the other chat channels
+    for (const channel of this.chatChannels) {
+      try {
+        await channel.stop();
+      } catch (error) {
+        this.logger.warn({ channel: channel.name, error: (error as Error).message }, 'Chat channel failed to stop cleanly');
+      }
+    }
+    this.chatChannels = [];
 
     // Stop Telegram channel
     if (this.telegramChannel) {
@@ -1700,6 +1787,22 @@ export class Gateway {
         }
       }
 
+      const chat = this.chatChannels.find(c => c.name === channel);
+      if (chat) {
+        if (rawUserId === 'default') {
+          const sole = chat.soleRecipient();
+          if (!sole) {
+            this.logger.warn({ channel }, 'Cannot resolve default recipient unambiguously');
+            return { source: null, rawUserId };
+          }
+          return { source, rawUserId: sole };
+        }
+        if (!chat.isAllowedRecipient(rawUserId)) {
+          this.logger.warn({ channel, userId: rawUserId }, 'Refusing delivery outside the channel allowlist');
+          return { source: null, rawUserId };
+        }
+      }
+
       this.logger.debug({ channel, userId: rawUserId }, 'Using prefixed trigger source');
       return { source, rawUserId };
     }
@@ -1710,6 +1813,13 @@ export class Gateway {
       const telegram = this.triggerSources.get('telegram');
       if (telegram && allowedTelegramUsers.length === 1) {
         return { source: telegram, rawUserId: allowedTelegramUsers[0] };
+      }
+      // Without Telegram, a single chat channel with exactly one allowlisted
+      // recipient is just as unambiguous.
+      const soleChats = telegram ? [] : this.chatChannels.filter(c => c.soleRecipient() !== null);
+      if (soleChats.length === 1) {
+        const source = this.triggerSources.get(soleChats[0].name);
+        if (source) return { source, rawUserId: soleChats[0].soleRecipient()! };
       }
       const api = this.triggerSources.get('api');
       if (api && !telegram) return { source: api, rawUserId };

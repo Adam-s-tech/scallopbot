@@ -9,6 +9,11 @@
  * Skill metadata for gating and configuration
  */
 export interface SkillMetadata {
+  /**
+   * Free-form agentskills.io metadata (string key/values such as author or
+   * version). Preserved for display; never used for gating.
+   */
+  [key: string]: unknown;
   openclaw?: {
     /** Always include skill regardless of gates */
     always?: boolean;
@@ -24,11 +29,18 @@ export interface SkillMetadata {
       anyBins?: string[];
       /** Required environment variables */
       env?: string[];
+      /** At least one of these environment variables must be set */
+      anyEnv?: string[];
       /** Required config paths */
       config?: string[];
     };
     /** Primary environment variable for API key */
     primaryEnv?: string;
+    /**
+     * Extra environment variables passed to the skill process when set, without
+     * gating availability (optional ports, defaults, feature switches).
+     */
+    optionalEnv?: string[];
     /** Installation instructions */
     install?: SkillInstaller[];
     /**
@@ -49,6 +61,13 @@ export interface SkillMetadata {
       requiresConfirmation?: boolean;
       /** String arguments may be shown to a person and must cross the final public-output boundary. */
       publicCommunication?: boolean;
+      /**
+       * Actions that always need an explicit owner approval (button or typed
+       * "yes"), even when the current message asked for them, e.g. [send, reply].
+       */
+      confirmActions?: string[];
+      /** Env var that, when exactly "true", lifts `confirmActions` back to the normal intent gate. */
+      confirmBypassEnv?: string;
     };
     /**
      * Explicit trust declaration for unattended factual reports. Merely being
@@ -89,6 +108,15 @@ export interface SkillFrontmatter {
   description: string;
   /** Optional homepage URL */
   homepage?: string;
+  /** agentskills.io: license name or bundled license file */
+  license?: string;
+  /** agentskills.io: environment requirements (free text) */
+  compatibility?: string;
+  /**
+   * agentskills.io (experimental): tools the skill expects to use. Surfaced to
+   * the model when the skill is loaded; not enforced as a permission grant.
+   */
+  'allowed-tools'?: string[];
   /** Whether exposed as slash command (default: true) */
   'user-invocable'?: boolean;
   /** Exclude from model prompt (default: false) */

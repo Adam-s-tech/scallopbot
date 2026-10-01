@@ -9,10 +9,25 @@ import { spawn } from 'child_process';
 import { access, readdir } from 'fs/promises';
 import { join, extname } from 'path';
 import { constants } from 'fs';
+import { createRequire } from 'module';
 import type { Logger } from 'pino';
 import type { Skill, SkillExecutionRequest, SkillExecutionResult } from './types.js';
 import { redactSensitiveText } from '../security/redaction.js';
 import { resolveStateUserId } from '../utils/state-user-id.js';
+import { SANDBOX_ENV_KEYS } from '../security/sandbox/index.js';
+
+/**
+ * tsx's CLI from this package's own dependencies. `npx tsx` resolves against the
+ * skill's cwd (the workspace), so outside the repo checkout (Docker, npm -g) it
+ * would download tsx at run time; running the bundled copy with node avoids that.
+ */
+const LOCAL_TSX_CLI: string | null = (() => {
+  try {
+    return createRequire(import.meta.url).resolve('tsx/cli');
+  } catch {
+    return null;
+  }
+})();
 
 /** Default timeout for script execution (120 seconds for browser/screenshot operations) */
 const DEFAULT_TIMEOUT_MS = 120000;
@@ -56,7 +71,7 @@ const SAFE_BASE_ENV_KEYS = [
 /** Non-secret Smartbot runtime paths/config used by bundled skills. */
 const SAFE_SMARTBOT_ENV_KEYS = [
   'AGENT_WORKSPACE', 'MEMORY_DB_PATH', 'SCALLOPBOT_DATA_DIR',
-  'OLLAMA_BASE_URL', 'LOCAL_BASE_URL',
+  'OLLAMA_BASE_URL', 'LOCAL_BASE_URL', 'EMBEDDING_PROVIDER', 'EMBEDDING_MODEL',
 ] as const;
 
 function copyDefinedEnv(target: Record<string, string>, keys: readonly string[]): void {
@@ -82,11 +97,19 @@ export function buildSkillSubprocessEnv(
   const env: Record<string, string> = {};
   copyDefinedEnv(env, SAFE_BASE_ENV_KEYS);
   copyDefinedEnv(env, SAFE_SMARTBOT_ENV_KEYS);
+  copyDefinedEnv(env, SANDBOX_ENV_KEYS);
 
   const openclaw = skill.frontmatter.metadata?.openclaw;
   const explicitlyAllowed = new Set(openclaw?.requires?.env ?? []);
   if (openclaw?.primaryEnv) explicitlyAllowed.add(openclaw.primaryEnv);
+  for (const key of openclaw?.requires?.anyEnv ?? []) explicitlyAllowed.add(key);
+  for (const key of openclaw?.optionalEnv ?? []) explicitlyAllowed.add(key);
   copyDefinedEnv(env, [...explicitlyAllowed]);
+  if (skill.source === 'bundled' && skill.name === 'mcp') {
+    // Remote MCP auth headers in ~/.smartbot/mcp.json may reference `${MCP_*}`
+    // variables. Only the bundled MCP client receives that namespace.
+    copyDefinedEnv(env, Object.keys(process.env).filter(key => /^MCP_[A-Z0-9_]+$/.test(key)));
+  }
 
   env.SKILL_NAME = skill.name;
   env.SKILL_DIR = skill.scriptsDir ? join(skill.scriptsDir, '..') : '';
@@ -306,8 +329,13 @@ export class SkillExecutor {
     // Determine how to run the script based on extension
     switch (ext) {
       case '.ts':
-        command = 'npx';
-        args = ['tsx', scriptPath];
+        if (LOCAL_TSX_CLI) {
+          command = process.execPath;
+          args = [LOCAL_TSX_CLI, scriptPath];
+        } else {
+          command = 'npx';
+          args = ['tsx', scriptPath];
+        }
         break;
       case '.js':
         command = 'node';

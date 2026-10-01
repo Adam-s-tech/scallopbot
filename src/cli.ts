@@ -15,6 +15,7 @@ import { explainProactiveDecisions, type ProactiveDecision } from './proactive/d
 import { explainEvolution } from './evolution/decision-log.js';
 import { SkillStore } from './evolution/skill-store.js';
 import type { EvolutionSignal, EvolutionDecision } from './evolution/types.js';
+import { registerSecretsCommand } from './security/secrets-cli.js';
 
 const VERSION = '0.1.0';
 
@@ -241,7 +242,7 @@ skillCommand
 // skill install
 skillCommand
   .command('install <slug>')
-  .description('Install a skill from ClawHub (clawhub.ai)')
+  .description('Install a skill from ClawHub (clawhub.ai) or a GitHub folder URL')
   .option('--url <url>', 'Install from a specific URL instead of ClawHub')
   .option('-v, --version <version>', 'Install a specific version')
   .option('--deps', 'Also install skill dependencies')
@@ -252,7 +253,11 @@ skillCommand
       console.log(`Installing skill: ${slug}...`);
 
       let result;
-      if (options.url) {
+      if (slug.startsWith('https://github.com/')) {
+        // Plain agentskills.io / Anthropic skill folders work as-is.
+        const { installSkillFromGitHub } = await import('./skills/github-install.js');
+        result = await installSkillFromGitHub(slug);
+      } else if (options.url) {
         // Install from direct URL
         result = await manager.installFromUrl(slug, options.url);
       } else {
@@ -727,6 +732,84 @@ program
     }
   });
 
+// reembed - move stored memory vectors into the configured embedding model
+program
+  .command('reembed')
+  .description('Re-embed memories into EMBEDDING_PROVIDER/EMBEDDING_MODEL (batched, resumable)')
+  .option('-b, --batch-size <n>', 'Texts per embedding request', '16')
+  .option('-n, --limit <n>', 'Stop after this many rows (run again to continue)')
+  .option('--all', 'Re-embed every stored vector, even ones already in the active model')
+  .option('--dry-run', 'Only report how many rows need embedding')
+  .action(async (options: { batchSize: string; limit?: string; all?: boolean; dryRun?: boolean }) => {
+    const { createConfiguredEmbedder, resolveEmbeddingSettings } = await import('./memory/embedding-config.js');
+    const { reembedStale } = await import('./memory/reembed.js');
+    const { TFIDFEmbedder } = await import('./memory/embeddings.js');
+    let db: ScallopDatabase | undefined;
+    try {
+      const config = loadConfig();
+      const configured = config.memory.dbPath;
+      const dbPath = nodePath.isAbsolute(configured)
+        ? configured
+        : nodePath.join(config.agent.workspace, configured);
+
+      const setup = await createConfiguredEmbedder({
+        ollamaBaseUrl: config.providers.ollama.baseUrl,
+        openaiApiKey: config.providers.openai.apiKey || undefined,
+        logger: {
+          info: (_obj, msg) => console.log(msg),
+          warn: (_obj, msg) => console.warn(msg),
+        },
+      });
+      if (setup.fellBack && resolveEmbeddingSettings().provider !== 'auto') {
+        // Never silently rewrite neural vectors as TF-IDF.
+        throw new Error(`${setup.reason ?? 'embedding provider unavailable'}; nothing re-embedded`);
+      }
+      console.log(`Embedding model: ${setup.key}`);
+
+      db = new ScallopDatabase(dbPath);
+      db.setEmbeddingModel(setup.key);
+      if (setup.embedder instanceof TFIDFEmbedder) {
+        setup.embedder.addDocuments(db.getAllMemories({ minProminence: 0.1, limit: 500 }).map(m => m.content));
+      }
+      if (options.all && !options.dryRun) db.markAllEmbeddingsStale();
+
+      const stale = db.countStaleEmbeddings(setup.key);
+      console.log(`Need embedding: ${stale.memories} memories, ${stale.summaries} session summaries`);
+      if (options.dryRun || stale.memories + stale.summaries === 0) return;
+
+      const abort = new AbortController();
+      process.once('SIGINT', () => {
+        console.log('\nStopping after the current batch; run again to resume.');
+        abort.abort();
+      });
+      const limit = options.limit ? Math.max(1, parseInt(options.limit, 10) || 1) : undefined;
+      const result = await reembedStale(db, setup.embedder, setup.key, {
+        batchSize: Math.max(1, parseInt(options.batchSize, 10) || 16),
+        limit,
+        signal: abort.signal,
+        onProgress: (p) => {
+          process.stdout.write(`\r  ${p.phase}: ${p.embedded + p.failed}/${p.total} (${p.failed} failed)   `);
+        },
+      });
+      process.stdout.write('\n');
+      console.log(
+        `Re-embedded ${result.memories.embedded} memories and ${result.summaries.embedded} summaries` +
+        (result.memories.failed + result.summaries.failed > 0
+          ? `; ${result.memories.failed + result.summaries.failed} failed (left for the next run)`
+          : ''),
+      );
+      if (result.incomplete) {
+        console.log(`Stopped early${result.error ? ` (${result.error})` : ''}; run again to resume.`);
+        if (result.error && result.error !== 'aborted') process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error('Re-embed failed:', (error as Error).message);
+      process.exitCode = 1;
+    } finally {
+      db?.close();
+    }
+  });
+
 // why-evolution - diagnose what the self-evolution engine has captured / learned
 program
   .command('why-evolution')
@@ -833,6 +916,78 @@ program
     } catch (error) {
       console.error('Skill curator failed:', (error as Error).message);
       process.exitCode = 1;
+    }
+  });
+
+// secrets - encrypted vault for API keys
+registerSecretsCommand(program);
+// web-login - create the web dashboard account ahead of the first browser visit
+program
+  .command('web-login')
+  .description('Create the web dashboard login (password read from SCALLOPBOT_WEB_PASSWORD or stdin)')
+  .requiredOption('-e, --email <email>', 'Login email for the dashboard')
+  .action(async (options: { email: string }) => {
+    try {
+      const password = process.env.SCALLOPBOT_WEB_PASSWORD
+        ?? (process.stdin.isTTY ? '' : (await readStdin()).split(/\r?\n/)[0] ?? '');
+      if (password.length < 8) throw new Error('Password must be at least 8 characters (set SCALLOPBOT_WEB_PASSWORD or pipe it on stdin)');
+      const config = loadConfig();
+      const configured = config.memory.dbPath;
+      const dbPath = nodePath.isAbsolute(configured)
+        ? configured
+        : nodePath.join(config.agent.workspace, configured);
+      const db = new ScallopDatabase(dbPath);
+      try {
+        if (db.hasAuthUser()) {
+          console.log('A dashboard login already exists; leaving it unchanged.');
+          return;
+        }
+        const bcrypt = await import('bcrypt');
+        db.createAuthUser(options.email, await bcrypt.hash(password, 12));
+        console.log(`Dashboard login created for ${options.email}`);
+      } finally {
+        db.close();
+      }
+    } catch (error) {
+      console.error('web-login failed:', (error as Error).message);
+      process.exitCode = 1;
+    }
+  });
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+// Google OAuth helper for the calendar skill
+program
+  .command('google-auth')
+  .description('Authorize Google Calendar and print GOOGLE_REFRESH_TOKEN (uses GOOGLE_CLIENT_ID/SECRET)')
+  .option('--client-id <id>', 'OAuth client ID (default: GOOGLE_CLIENT_ID)')
+  .option('--client-secret <secret>', 'OAuth client secret (default: GOOGLE_CLIENT_SECRET)')
+  .option('--port <port>', 'Loopback port (default: random)')
+  .option('--scope <scope>', 'OAuth scope (default: calendar.events)')
+  .action(async (options: { clientId?: string; clientSecret?: string; port?: string; scope?: string }) => {
+    try {
+      const clientId = options.clientId || process.env.GOOGLE_CLIENT_ID;
+      const clientSecret = options.clientSecret || process.env.GOOGLE_CLIENT_SECRET;
+      if (!clientId || !clientSecret) {
+        throw new Error('Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (a "Desktop app" OAuth client) or pass --client-id/--client-secret');
+      }
+      const { runGoogleAuth } = await import('./integrations/calendar/google-auth.js');
+      const refreshToken = await runGoogleAuth({
+        clientId,
+        clientSecret,
+        scope: options.scope,
+        port: options.port ? Number.parseInt(options.port, 10) : undefined,
+      });
+      console.log('\nAdd this to your .env:\n');
+      console.log(`GOOGLE_REFRESH_TOKEN=${refreshToken}`);
+      process.exit(0);
+    } catch (error) {
+      console.error('google-auth failed:', (error as Error).message);
+      process.exit(1);
     }
   });
 

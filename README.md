@@ -29,7 +29,7 @@
 
 Open-source personal AI agents like [OpenClaw](https://github.com/openclaw/openclaw) excel at tool orchestration, but their memory mostly stores and promotes notes rather than reshaping them, and they have no self-reflection or autonomous reasoning loop. ScallopBot addresses this cognition gap with a bio-inspired cognitive architecture that maintains full compatibility with the OpenClaw skill ecosystem. Runs at an estimated $0.05--0.10/day in model spend -- see the [cost comparison](https://scallopbot.com/cost). Comparing it with a gateway like LiteLLM? See [ScallopBot as a LiteLLM alternative](https://scallopbot.com/litellm-alternative/).
 
-ScallopBot runs on your own server, routes each request to the cheapest model that can handle it, tracks every cent in real time, and fails over between the LLM providers you have keys for (7 supported). You talk to it over Telegram, the web dashboard (REST + WebSocket API), or a CLI -- all from a single Node.js process. Adapters for Discord, WhatsApp, Slack, Signal and Matrix exist in `src/channels/` but are not yet started by the gateway.
+ScallopBot runs on your own server, routes each request to the cheapest model that can handle it, tracks every cent in real time, and fails over between the LLM providers you have keys for (7 supported). You talk to it over Telegram, the web dashboard (REST + WebSocket API), or a CLI, and optionally Discord, Slack, WhatsApp, Signal or Matrix -- all from a single Node.js process. Each extra chat channel starts only when its credentials are set.
 
 The architecture is validated against 30 research works from 2023--2026 across six domains (memory retrieval, lifecycle management, associative reasoning, sleep-inspired consolidation, affect modelling, and proactive intelligence). The full cognitive pipeline operates at an estimated **$0.05--0.10 per day** in model spend.
 
@@ -64,7 +64,65 @@ per-conversation scores. Both arms use the same strict QA-answerer prompt.
 The harness lives in [`src/eval/`](src/eval/); full methodology is in the
 [paper](Paper2026.pdf).
 
-## Quick Start
+## Install
+
+Every route ends with the bot running and the web dashboard on
+`http://localhost:3000`. The first browser visit creates the dashboard login,
+unless the installer (or `scallopbot web-login`) already set one. When you copy
+`.env.example` by hand, set one provider key and comment out the placeholder
+`TELEGRAM_BOT_TOKEN` line if you are not using Telegram.
+
+### One-liner (Linux, macOS, Raspberry Pi OS 64-bit)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tashfeenahmed/scallopbot/main/scripts/install.sh | bash
+```
+
+[`scripts/install.sh`](scripts/install.sh) installs Node 24 through nvm if you
+don't have it (no sudo), clones or updates `~/scallopbot`, runs `npm ci` and the
+build, asks for a provider key, an optional Telegram token and an optional
+dashboard login, writes `.env`, and can install a pm2 or systemd user service.
+Re-running it updates the checkout and keeps your `.env`. Flags go after
+`bash -s --`, for example `| bash -s -- --dir /opt/scallopbot --service pm2`;
+`--non-interactive` reads the answers from `ANTHROPIC_API_KEY` (or another
+provider key), `TELEGRAM_BOT_TOKEN`, `SCALLOPBOT_WEB_EMAIL` and
+`SCALLOPBOT_WEB_PASSWORD`; `--dry-run` shows what it would do.
+
+### Docker
+
+```bash
+git clone https://github.com/tashfeenahmed/scallopbot.git && cd scallopbot
+cp .env.example .env          # set a provider key
+docker compose up -d --build
+```
+
+The image (`node:24-slim`, amd64 and arm64) runs as a non-root user and keeps
+everything it writes, including the SQLite memory, sessions, workspace and
+installed skills, in the `scallopbot-data` volume at `/data`. The port is
+published on `127.0.0.1` only; put a reverse proxy or Tailscale in front before
+exposing it. An Ollama service is ready to uncomment in
+[`docker-compose.yml`](docker-compose.yml). Local voice (Python, ffmpeg) and the
+browser skill's Chrome are not in the image. `install.sh --docker` fetches just
+the compose file and a filled-in `.env` and builds straight from GitHub.
+
+### npm (global CLI)
+
+ScallopBot is not on the npm registry yet, so build and pack it from a clone:
+
+```bash
+git clone https://github.com/tashfeenahmed/scallopbot.git && cd scallopbot
+npm ci && npm run build && npm pack
+npm install -g ./scallopbot-0.1.0.tgz
+
+mkdir -p ~/scallopbot-data && cd ~/scallopbot-data
+cp "$(npm root -g)/scallopbot/.env.example" .env   # set a provider key
+scallopbot start
+```
+
+`scallopbot` reads `.env` from, and keeps its data in, the directory you start
+it from (or `AGENT_WORKSPACE`).
+
+### From source
 
 ```bash
 git clone https://github.com/tashfeenahmed/scallopbot.git
@@ -80,6 +138,14 @@ node dist/cli.js start
 
 Requires Node.js 24+.
 
+### Install the dashboard as an app
+
+The web dashboard is a Progressive Web App. In Chrome or Edge use **Install
+app** in the address bar; on iPhone or iPad use **Share → Add to Home Screen**.
+Browsers only offer this over HTTPS or on `localhost`. The service worker
+caches the app shell so it opens offline; chat, memory and API data always come
+live from your server.
+
 ## MCP
 
 ScallopBot is MCP-native in both directions: it **consumes** MCP servers through the
@@ -87,6 +153,12 @@ bundled [`mcp` skill](src/skills/bundled/mcp/), and it **exposes its own memory*
 server. Point Claude Code, Codex, or any other MCP client at it and that client reads and
 writes the same memory the bot uses -- store something from your editor, and the bot
 recalls it in Telegram.
+
+The `mcp` skill talks to local stdio servers (`command`) and remote servers over
+Streamable HTTP or the older SSE transport (`url` + `transport: "http" | "sse"`), with
+headers or a bearer token that can reference `${MCP_*}` environment variables. Each call
+opens a short-lived session; tools must be allow-listed per server. See the
+[skill's README](src/skills/bundled/mcp/SKILL.md) for the config format.
 
 Three tools are exposed:
 
@@ -175,7 +247,7 @@ ACT-R-inspired spreading activation over typed relation graphs (UPDATES, EXTENDS
 
 ### Hybrid Memory Engine
 
-SQLite-backed memory with ACID guarantees. Combines BM25 keyword scoring with semantic embeddings (Ollama/OpenAI) and optional LLM re-ranking. Recall uses smooth activation from temporal decay, lifecycle, genuine topic relevance, salience, and user confirmation: an old topic fades from general context but can return naturally when it becomes relevant, without magic "history" wording. Automatic retrieval is telemetry only and never reinforces freshness or utility. Assistant self-reflection and agent-subject facts remain separate from user memory. The lifecycle includes category-specific half-lives (14 days for events to 346 days for relationships), BFS-clustered fusion, and utility-based forgetting with soft-archive before hard-prune.
+SQLite-backed memory with ACID guarantees. Combines BM25 keyword scoring with semantic embeddings and optional LLM re-ranking. `EMBEDDING_PROVIDER` picks `ollama` (local `nomic-embed-text` or `mxbai-embed-large`), `openai`, or `tfidf`; unset, it tries Ollama and falls back to TF-IDF. Each stored vector is tagged with its model, so vectors from different models are never compared, and `reembed` moves an existing memory store to a new model. Recall uses smooth activation from temporal decay, lifecycle, genuine topic relevance, salience, and user confirmation: an old topic fades from general context but can return naturally when it becomes relevant, without magic "history" wording. Automatic retrieval is telemetry only and never reinforces freshness or utility. Assistant self-reflection and agent-subject facts remain separate from user memory. The lifecycle includes category-specific half-lives (14 days for events to 346 days for relationships), BFS-clustered fusion, and utility-based forgetting with soft-archive before hard-prune.
 
 ### Cost-Aware Model Routing
 
@@ -188,6 +260,8 @@ Speech-to-text via faster-whisper (CTranslate2-optimized Whisper) and text-to-sp
 ### Skills-Only Architecture
 
 All capabilities -- bash, browser, file I/O, git, Docker, PDF, web search, memory -- are implemented as self-contained skills using the [OpenClaw](https://github.com/openclaw/openclaw) SKILL.md format. Skills declare their own requirements (binaries, env vars, OS) and are gated at load time. Community skills install from [ClawHub](https://clawhub.ai) with a single CLI command.
+
+Plain [agentskills.io](https://agentskills.io) / Anthropic skills (just `name` + `description`, optional `license`, `allowed-tools`, `metadata`) load unchanged. Only the name and description go in the prompt; the body is loaded when the model calls `load_procedure`, and bundled `references/` or `scripts/` files are listed and read on demand. A `scripts/` folder only turns a skill into a callable tool when it also has an `inputSchema` or a `scripts/run.*` entrypoint. `allowed-tools` is shown to the model but does not grant permissions.
 
 ### Evidence-Gated Procedural Learning
 
@@ -287,7 +361,7 @@ sent as a bearer token.
 
 ## Bundled Skills
 
-29 skills ship out of the box:
+34 skills ship out of the box:
 
 | Skill | Description |
 |-------|-------------|
@@ -313,18 +387,30 @@ sent as a bearer token.
 | `batch` | Run several tool calls in parallel |
 | `pdf` | Create PDFs with [Typst](https://typst.app), read with poppler, edit with qpdf |
 | `notion` | Typed Notion API access |
+| `email` | Read, search and send email over IMAP/SMTP (sends need your yes) |
+| `calendar` | Google Calendar read/write (writes need your yes) or a read-only ICS feed |
 | `mcp` | Call tools on configured MCP servers |
 | `git` | Version control operations |
 | `npm` | Package management |
 | `docker` | Container management |
 | `telegram_send` | Send messages programmatically |
+| `image_gen` | Generate or edit an image (OpenAI, FAL or OpenRouter) and send it to the chat |
+| `phone_call` | Twilio call that speaks a message, optionally collecting a spoken/keypad reply |
+| `sms` | Send a text message via Twilio |
 | `reminder` | Reminders (deprecated; use `board`) |
 | `progress` | Goal progress (deprecated; use `board`) |
 
-Install community skills from ClawHub:
+### Images, calls and SMS
+
+- **`image_gen`** needs `OPENAI_API_KEY`, `FAL_KEY` or `OPENROUTER_API_KEY` (or pick one with `IMAGE_GEN_PROVIDER`). Images are saved under `output/` and sent straight to the chat (Telegram photo, inline preview in the web dashboard). Each image's cost is recorded in the cost tracker, so it counts toward `DAILY_BUDGET`/`MONTHLY_BUDGET`, and generation is refused once a budget is used up. Prices are the API's reported usage where it gives one (OpenAI token usage, OpenRouter `usage.cost`), otherwise a per-image estimate.
+- **`phone_call` / `sms`** need `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and `TWILIO_FROM_NUMBER`. Numbers in `PHONE_ALLOWED_NUMBERS` go straight through; any other number gets a one-tap approval prompt per recipient. Calls use Twilio's voice by default. With `PUBLIC_BASE_URL` set, they use ScallopBot's own TTS and can collect the callee's reply (`wait_for_reply`), which is posted back to you in chat. Twilio's webhook at `/api/twilio/gather` is checked against `X-Twilio-Signature`. Calls and SMS record an estimated price (US list rates) against the budget. `PHONE_REMINDER_CALLS=tagged|all` with `PHONE_OWNER_NUMBER` also phones you when a reminder fires.
+- These variables are read at call time from the environment (or the runtime key vault), not in `config.ts`. See [.env.example](.env.example).
+
+Install community skills from ClawHub, or any skill folder on GitHub:
 
 ```bash
 node dist/cli.js skill install elicitation
+node dist/cli.js skill install https://github.com/anthropics/skills/tree/main/skills/pdf
 ```
 
 ## Channels
@@ -332,10 +418,38 @@ node dist/cli.js skill install elicitation
 | Channel | Status | Features |
 |---------|--------|----------|
 | **Telegram** | Live (`start`) | Voice transcription, voice reply, file upload/download, photo analysis, per-user onboarding |
-| **Web dashboard / REST API** | Live (`start`, needs `WEB_UI_ENABLED=true`) | `POST /api/chat`, SSE streaming, session management, file download, budget management (`POST /api/costs/budget`) |
+| **Web dashboard / REST API** | Live (`start`, needs `WEB_UI_ENABLED=true`) | `POST /api/chat`, SSE streaming, session management, file download, budget management (`POST /api/costs/budget`), push-to-talk STT/TTS (`/api/voice/*`) |
 | **WebSocket** | Live (served by the API channel) | Real-time bidirectional communication with the web dashboard |
 | **CLI** | Live (`chat`) | Interactive terminal session with session resume (`-s <id>`) |
-| Discord, WhatsApp, Slack, Signal, Matrix | Adapter code only | Classes exist in `src/channels/` but the gateway does not start them yet |
+| **Discord** | Starts when `DISCORD_BOT_TOKEN` is set | DMs and @mentions, `/ask` `/reset` `/help` `/status` slash commands, proactive DMs, file sending |
+| **Slack** | Starts when `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` are set (Socket Mode) | DMs and @mentions, optional `/scallopbot` command, proactive DMs, file sending |
+| **WhatsApp** | Starts when `WHATSAPP_ENABLED=true` and `WHATSAPP_ALLOWED_NUMBERS` is set | 1:1 chats via a linked device (Baileys), voice-note transcription, proactive messages, file sending |
+| **Signal** | Starts when `SIGNAL_PHONE_NUMBER` is set and `signal-cli` is installed | 1:1 chats via `signal-cli` JSON-RPC, voice-note transcription, proactive messages, file sending |
+| **Matrix** | Starts when `MATRIX_HOMESERVER_URL` + `MATRIX_ACCESS_TOKEN` are set | DMs and mentions in unencrypted rooms, `!help` `!reset` `!status`, proactive room messages, file sending |
+
+Discord, Slack, WhatsApp, Signal and Matrix are covered by tests against mocked SDK clients (start, inbound message to agent and back, allowlist, proactive delivery); they have not been exercised against the live services in CI. Telegram-only features (approval buttons, `/model`, `/setup`, photo analysis, voice replies) are not available on them; a blocked write is answered by replying "yes" or "no". A channel that fails to start (bad token, missing optional package) is logged and skipped, and the rest of the gateway keeps running.
+
+**What each channel needs** (all variables are in `.env.example`):
+
+| Channel | Credentials | Allowlist | Notes |
+|---------|-------------|-----------|-------|
+| Discord | `DISCORD_BOT_TOKEN` (`DISCORD_APPLICATION_ID` optional) | `DISCORD_ALLOWED_USERS` (user IDs) | Enable the privileged **Message Content** intent for the bot; `discord.js` is a regular dependency |
+| Slack | `SLACK_BOT_TOKEN` (xoxb-), `SLACK_APP_TOKEN` (xapp-, `connections:write`) | `SLACK_ALLOWED_USERS` (member IDs) | Socket Mode on; scopes `chat:write`, `app_mentions:read`, `im:history`, `im:read`, `im:write`, `files:write`; events `app_mention`, `message.im`; optional package `@slack/bolt` |
+| WhatsApp | `WHATSAPP_ENABLED=true`; link once via pairing code (`WHATSAPP_PHONE_NUMBER`) or QR | `WHATSAPP_ALLOWED_NUMBERS` (**required**) | Rides a real WhatsApp account, so it refuses to start without an allowlist; session stored in `WHATSAPP_AUTH_DIR`; optional packages `@whiskeysockets/baileys`, `@hapi/boom` (`qrcode-terminal` to render the QR) |
+| Signal | `SIGNAL_PHONE_NUMBER` (registered with `signal-cli`) | `SIGNAL_ALLOWED_NUMBERS` | Needs the `signal-cli` binary (`SIGNAL_CLI_PATH`, `SIGNAL_CONFIG_PATH`); group messages are ignored |
+| Matrix | `MATRIX_HOMESERVER_URL`, `MATRIX_ACCESS_TOKEN` (`MATRIX_USER_ID` optional) | `MATRIX_ALLOWED_USERS`, `MATRIX_ALLOWED_ROOMS` | No end-to-end encryption: use unencrypted rooms; auto-joins invites from allowed users; optional package `matrix-js-sdk` |
+
+An empty allowlist means anyone who can reach the bot can use it (a warning is logged). Every channel's proactive delivery is held to the same allowlist. Set `<CHANNEL>_ENABLED=false` to keep a channel off without removing its credentials.
+
+## Email and Calendar
+
+Both are optional and configured in `.env` (see `.env.example`).
+
+- **Email** (`email` skill): list, search and read over IMAP; send and reply over SMTP. Works with Gmail app passwords and any IMAP/SMTP provider. Every send or reply is blocked until you approve that exact email (recipients, subject, body) with the yes/no prompt; `EMAIL_SEND_WITHOUT_APPROVAL=true` relaxes this to "you asked for it in your message".
+- **Email in** (`EMAIL_INBOUND_ENABLED=true`): the bot polls your inbox. Mail from `EMAIL_ALLOWED_SENDERS` that passes DMARC/DKIM becomes a message to the bot (one session per sender) and the answer is emailed back in-thread. Email turns can't approve sends or calendar writes. `EMAIL_NOTIFY=important|all` posts a one-line "new email" note to your main channel instead. Polling only, no IMAP IDLE.
+- **Calendar** (`calendar` skill): Google Calendar via an OAuth refresh token (`node dist/cli.js google-auth` prints one), with upcoming/search/create/update/delete; each write needs your yes. Without Google, `CALENDAR_ICS_URL` gives read-only access to any ICS feed (recurring, all-day and timezone-aware). `CALENDAR_REMINDER_MINUTES=15` sends a heads-up before timed events.
+
+Google refresh tokens for OAuth apps left in "Testing" expire after 7 days; publish the consent screen (unverified is fine for your own account) to keep the token.
 
 ## Web Dashboard
 
@@ -345,7 +459,8 @@ A React + Tailwind + Vite single-page app served from the API channel. Features:
 - Debug mode showing tool execution (start/complete/error), thinking steps, and memory operations
 - Cost panel with daily/monthly budget bars, per-model breakdown, and a 14-day spending chart
 - Delegated Tasks rail with live status, parent/child hierarchy, acceptance evidence, blockers, logs, cancellation, steering, and follow-ups
-- File send/receive with download links
+- File send/receive with download links; images show inline
+- Push-to-talk voice mode: hold the mic button (or Space/Enter on it) to talk. The clip goes through the same STT as Telegram voice notes, and the reply is read aloud when TTS is configured
 - Proactive message delivery (reminders, triggers)
 
 ## Configuration
@@ -369,6 +484,26 @@ BUDGET_WARNING_THRESHOLD=0.75      # default; dashboard bars turn amber past thi
 ```
 
 Common options: [.env.example](.env.example); every variable is read in [`src/config/config.ts`](src/config/config.ts).
+
+## Security
+
+Three opt-in layers sit on top of the existing tool-intent gates, workspace path checks and log redaction. They reduce risk; they do not make it safe to give the bot untrusted users or untrusted skills.
+
+**Sandboxed execution** (`bash`, `run_code`). `SANDBOX_MODE` picks the backend; the dangerous-command blocklist still runs first.
+
+| Mode | What it does |
+|------|--------------|
+| `off` (default) | Runs on the host, as before |
+| `auto` | Best native backend: `seatbelt` on macOS, `bwrap` on Linux if it works; otherwise `off` with a startup warning |
+| `seatbelt` | macOS `sandbox-exec`: writes denied outside the workspace and temp dirs |
+| `bwrap` | Linux bubblewrap: read-only root, writable workspace, private `/tmp` and PID namespace |
+| `docker` | Throwaway container per command, workspace bind-mounted, `--cap-drop ALL`, CPU/memory/PID limits, no network unless `SANDBOX_NETWORK=on` |
+
+An explicitly named backend that is missing makes commands fail rather than run unsandboxed. All backends hide the vault, its key file and the bot's `.env` from sandboxed commands. The default stays `off` because a read-only root breaks commands that write outside the workspace (global `pip`/`npm`, `~/.cache`, a memory DB under `/opt`); try `SANDBOX_MODE=auto` and add paths to `SANDBOX_WRITABLE` as needed. On a Pi: `sudo apt install bubblewrap`. `auto` never picks Docker, because the image must carry your tools (set `SANDBOX_IMAGE`). The startup log names the active backend.
+
+**Encrypted secret vault.** `scallopbot secrets set|get|list|rm|import-env` keeps keys in `~/.scallopbot/secrets.enc` (AES-256-GCM, scrypt-derived key). The key comes from `SCALLOPBOT_VAULT_KEY` or a `0600` key file (`~/.scallopbot/vault.key`, created on first `set`). At startup vault values fill only variables that the shell or `.env` left unset, so environment variables win; run `scallopbot secrets import-env --strip` to move keys out of `.env`. Vault values are added to log and output redaction. With the key file beside the vault, this protects against leaked `.env` files, backups and screenshots. It does not protect against someone who can read your home directory; for that, supply `SCALLOPBOT_VAULT_KEY` from systemd credentials or a keychain.
+
+**Prompt-injection scanning.** Every tool result is scored with heuristics before the model sees it: "ignore previous instructions", role-tag and tool-call spoofing, hidden Unicode tag characters, base64-encoded instructions, exfiltration URLs and requests for secrets. Flagged output is wrapped in markers with a warning that it is data, not instructions, and a warning is logged (rule names and score only). `PROMPT_INJECTION_SCAN=block` also withholds high-confidence hits from external-content tools (`webfetch`, `web_search`, `browser`, `pdf`, `mcp`). It is a heuristic: expect some misses and the occasional harmless page being wrapped.
 
 ## Reminders
 
@@ -446,7 +581,7 @@ Reminders can be plain nudges or tasks; a task runs a sub-agent at the scheduled
 | **Smart model selection** | Manual | Auto-routes by complexity |
 | **Local voice (zero cost)** | -- | Kokoro TTS + faster-whisper STT |
 | **Skill ecosystem** | 100+ bundled, 3000+ ClawHub | Full OpenClaw SKILL.md compatibility |
-| **Channel support** | 25+ platforms | Telegram, web dashboard/API, CLI (5 more adapters not yet wired) |
+| **Channel support** | 25+ platforms | Telegram, web dashboard/API, CLI, Discord, Slack, WhatsApp, Signal, Matrix |
 | **Native apps** | macOS/iOS/Android/Windows/Linux | -- |
 
 OpenClaw column reflects its public README and docs as of October 2026; it ships fast, so corrections are welcome. A fuller write-up is at [scallopbot.com/vs/openclaw](https://scallopbot.com/vs/openclaw/).
@@ -510,8 +645,9 @@ sudo systemctl enable --now scallopbot
 | `chat` | Interactive CLI session (`-s <id>` to resume) |
 | `config` | Show current configuration (`--json` for machine output) |
 | `version` | Show version |
+| `web-login -e <email>` | Create the dashboard login (password from `SCALLOPBOT_WEB_PASSWORD` or stdin) |
 | `skill search <query>` | Search ClawHub |
-| `skill install <slug>` | Install from ClawHub |
+| `skill install <slug\|github-url>` | Install from ClawHub or a GitHub skill folder |
 | `skill uninstall <name>` | Remove a skill |
 | `skill list` | List installed skills |
 | `skill update [name]` | Update one or all skills |
@@ -520,13 +656,18 @@ sudo systemctl enable --now scallopbot
 | `skill-curator pin <name>` | Keep an agent-created skill active |
 | `skill-curator restore <name>` | Restore a recoverably archived skill |
 | `migrate run` | Migrate legacy JSONL memories to SQLite |
+| `secrets set <name> [value]` | Store a secret in the encrypted vault (omit the value to type it hidden) |
+| `secrets get <name>` / `list` / `rm <name>` | Read, list names, or delete vault secrets |
+| `secrets import-env [file]` | Move credential-looking variables from `.env` into the vault (`--strip` removes them from the file) |
+| `google-auth` | Authorize Google Calendar and print `GOOGLE_REFRESH_TOKEN` |
+| `reembed` | Re-embed memories into the current `EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` (`--dry-run`, `--limit`, `--all`; resumable) |
 
 ## Project Structure
 
 ```
 src/
 ├── agent/          # Agent loop, session management, crash recovery
-├── channels/       # Telegram, CLI, API live; Discord/WhatsApp/Slack/Signal/Matrix adapters unwired
+├── channels/       # Telegram, CLI, API, Discord, Slack, WhatsApp, Signal, Matrix adapters
 ├── config/         # Zod-validated configuration schemas
 ├── dashboard/      # Systemd config generator, crash recovery
 ├── gateway/        # Server orchestration and channel initialization
@@ -537,7 +678,7 @@ src/
 ├── providers/      # LLM provider implementations (7 providers)
 ├── reliability/    # Circuit breaker, graceful degradation
 ├── routing/        # Cost tracking, complexity analysis, model selection
-├── skills/         # Loader, registry, executor, ClawHub client (29 bundled)
+├── skills/         # Loader, registry, executor, ClawHub client (34 bundled)
 ├── evolution/      # Evidence-gated procedural skill learning and curation
 ├── goals/          # Persistent, budgeted, verified autonomous goals
 ├── workflow/       # Context-efficient validated tool DAG execution
