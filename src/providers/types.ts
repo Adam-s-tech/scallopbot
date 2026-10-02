@@ -94,6 +94,12 @@ export interface CompletionRequest {
   /** Token budget for thinking/reasoning (used by thinking levels system) */
   thinkingBudgetTokens?: number;
   /**
+   * Reasoning effort for effort-style APIs (GPT-5.x, o-series, OpenRouter
+   * reasoning.effort). Applies only when thinking is enabled; without it the
+   * provider keeps its previous default.
+   */
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  /**
    * Provider-enforced JSON shape for strict background routes. Providers with
    * native JSON Schema support send the full schema; compatible providers that
    * only support JSON mode may enforce JSON and leave final schema validation
@@ -122,6 +128,22 @@ export interface CompletionRequest {
   purpose?: string;
   /** Session/run id attached to the trace row (metadata only). */
   traceSessionId?: string;
+  /**
+   * Stable prompt-cache key (the session root id). Providers with keyed
+   * caching (OpenAI, OpenRouter) send it as `prompt_cache_key` so every
+   * request of one conversation lands on the same cache shard.
+   */
+  cacheKey?: string;
+  /**
+   * Prompt-cache lifetime hint. '1h' for interactive chat, '5m' (default)
+   * for cron and sub-agent work. Anthropic honours it on its breakpoints.
+   */
+  cacheTtl?: '5m' | '1h';
+  /**
+   * Add cache breakpoints on the last messages so multi-step turns stop
+   * re-billing the whole history (Anthropic-style explicit caching).
+   */
+  cacheMessages?: boolean;
   /** Extra local diagnostics for trace rows. Metadata only; never sent upstream. */
   traceMetadata?: Record<string, unknown>;
 }
@@ -134,6 +156,8 @@ export interface TokenUsage {
   reasoningTokens?: number;
   /** Input tokens served from prompt cache (subset of inputTokens) */
   cachedInputTokens?: number;
+  /** Input tokens written to the prompt cache this call (subset of inputTokens) */
+  cacheWriteTokens?: number;
   /**
    * Largest single-iteration prompt size in a multi-iteration turn.
    * `inputTokens` is the sum across iterations (for billing); `peakInputTokens`
@@ -159,6 +183,26 @@ export interface StreamEvent {
   delta?: { type: string; text?: string };
 }
 
+/**
+ * Callbacks for a streamed completion. All are optional and synchronous;
+ * providers call them as chunks arrive and still resolve the assembled
+ * CompletionResponse at the end.
+ */
+export interface StreamHandlers {
+  /** Visible answer text as it is generated. Never reasoning/thinking text. */
+  onTextDelta?(text: string): void;
+  /**
+   * A tool call started streaming. Any text already delivered was planning
+   * beside a tool call, not the reply.
+   */
+  onToolUseStart?(name: string): void;
+  /**
+   * Text delivered so far is void: the call failed after streaming began and
+   * a retry or fallback provider will start over.
+   */
+  onTextReset?(): void;
+}
+
 // Provider interface
 export interface LLMProvider {
   name: string;
@@ -180,6 +224,17 @@ export interface LLMProvider {
    * Create a streaming completion
    */
   stream?(request: CompletionRequest): AsyncIterable<StreamEvent>;
+
+  /**
+   * Streamed completion: same request body as complete() plus the provider's
+   * stream flags, so prompt-cache prefixes stay byte-identical. Text deltas go
+   * to `handlers` as they arrive; the promise resolves to the same
+   * CompletionResponse complete() would return (tool calls with parsed
+   * arguments, usage incl. cached tokens, stop reason). Providers without
+   * streaming leave this undefined; callers use completeWithStream() to fall
+   * back to complete().
+   */
+  completeStream?(request: CompletionRequest, handlers: StreamHandlers): Promise<CompletionResponse>;
 
   /**
    * Check if the provider is available (has valid API key, etc.)

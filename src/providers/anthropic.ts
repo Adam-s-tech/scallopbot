@@ -6,8 +6,10 @@ import type {
   CompletionResponse,
   ContentBlock,
   StreamEvent,
+  StreamHandlers,
   SystemPrompt,
 } from './types.js';
+import { StreamInterruptedError, trackingHandlers } from './streaming.js';
 import { DEFAULT_MAX_RETRIES, RETRY_STATUS_CODES, RETRY_DELAY_MS } from './constants.js';
 
 /**
@@ -39,7 +41,7 @@ export const ANTHROPIC_MODELS = {
   'sonnet': 'claude-sonnet-4-5-20250929',
 } as const;
 
-const DEFAULT_MODEL = 'claude-sonnet-4-5-20250929';
+const DEFAULT_MODEL = 'claude-sonnet-5-5';
 const DEFAULT_MAX_TOKENS = 8192;
 
 export class AnthropicProvider implements LLMProvider {
@@ -66,15 +68,16 @@ export class AnthropicProvider implements LLMProvider {
     return !!this.apiKey && this.apiKey.length > 0;
   }
 
-  async complete(request: CompletionRequest): Promise<CompletionResponse> {
-    const params: Anthropic.MessageCreateParams = {
+  /** The request params shared by complete() and completeStream(). */
+  private buildParams(request: CompletionRequest): Anthropic.MessageCreateParamsNonStreaming {
+    return {
       model: this.model,
-      messages: this.formatMessages(request.messages),
+      messages: this.formatMessages(request.messages, request),
       max_tokens: request.maxTokens || DEFAULT_MAX_TOKENS,
-      ...(request.system && { system: this.formatSystem(request.system) }),
+      ...(request.system && { system: this.formatSystem(request.system, request.cacheTtl) }),
       ...(request.temperature !== undefined && { temperature: request.temperature }),
       ...(request.stopSequences && { stop_sequences: request.stopSequences }),
-      ...(request.tools && { tools: this.formatTools(request.tools) }),
+      ...(request.tools && { tools: this.formatTools(request.tools, request.cacheTtl) }),
       ...(request.enableThinking === false && { thinking: { type: 'disabled' as const } }),
       ...(request.structuredOutput && {
         output_config: {
@@ -85,6 +88,10 @@ export class AnthropicProvider implements LLMProvider {
         },
       }),
     };
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    const params = this.buildParams(request);
 
     const response = await this.executeWithRetry(() =>
       request.signal
@@ -95,16 +102,48 @@ export class AnthropicProvider implements LLMProvider {
     return this.formatResponse(response);
   }
 
+  /**
+   * Streamed completion via the SDK's message stream: complete()'s params
+   * (same system/tool/message cache breakpoints) with `stream: true`. The SDK
+   * assembles the final message, including tool input JSON and cache usage.
+   * Retries apply only until the first visible delta.
+   */
+  async completeStream(request: CompletionRequest, handlers: StreamHandlers): Promise<CompletionResponse> {
+    const params = this.buildParams(request);
+    const tracked = trackingHandlers(handlers);
+
+    const message = await this.executeWithRetry(async () => {
+      try {
+        const stream = request.signal
+          ? this.client.messages.stream(params, { signal: request.signal })
+          : this.client.messages.stream(params);
+        for await (const event of stream) {
+          if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+            tracked.handlers.onTextDelta?.(event.delta.text);
+          } else if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') {
+            tracked.handlers.onToolUseStart?.(event.content_block.name);
+          }
+        }
+        return await stream.finalMessage();
+      } catch (error) {
+        if (tracked.delivered()) throw new StreamInterruptedError(error);
+        throw error;
+      }
+    });
+
+    return this.formatResponse(message);
+  }
+
   async *stream(request: CompletionRequest): AsyncIterable<StreamEvent> {
     const params: Anthropic.MessageCreateParams = {
       model: this.model,
-      messages: this.formatMessages(request.messages),
+      messages: this.formatMessages(request.messages, request),
       max_tokens: request.maxTokens || DEFAULT_MAX_TOKENS,
       stream: true,
-      ...(request.system && { system: this.formatSystem(request.system) }),
+      ...(request.system && { system: this.formatSystem(request.system, request.cacheTtl) }),
       ...(request.temperature !== undefined && { temperature: request.temperature }),
       ...(request.stopSequences && { stop_sequences: request.stopSequences }),
-      ...(request.tools && { tools: this.formatTools(request.tools) }),
+      ...(request.tools && { tools: this.formatTools(request.tools, request.cacheTtl) }),
       ...(request.enableThinking === false && { thinking: { type: 'disabled' as const } }),
       ...(request.structuredOutput && {
         output_config: {
@@ -125,8 +164,11 @@ export class AnthropicProvider implements LLMProvider {
     }
   }
 
-  private formatMessages(messages: CompletionRequest['messages']): Anthropic.MessageParam[] {
-    return messages
+  private formatMessages(
+    messages: CompletionRequest['messages'],
+    request?: Pick<CompletionRequest, 'cacheMessages' | 'cacheTtl'>,
+  ): Anthropic.MessageParam[] {
+    const formatted: Anthropic.MessageParam[] = messages
       .filter((msg) => {
         // Skip messages with empty/null content to avoid API errors
         if (msg.content == null) return false;
@@ -141,18 +183,38 @@ export class AnthropicProvider implements LLMProvider {
           ? msg.content.filter((b) => b.type !== 'thinking') as unknown as Anthropic.ContentBlockParam[]
           : msg.content,
       }));
+    if (!request?.cacheMessages) return formatted;
+
+    // Breakpoints 3 and 4 (after tools and system): the last two messages.
+    // The newest marks the end of this call's prefix; the one before it is
+    // the previous call's end, so the read hits whatever was written last time.
+    const cacheControl = cacheControlFor(request.cacheTtl);
+    let marked = 0;
+    for (let i = formatted.length - 1; i >= 0 && marked < 2; i--) {
+      const message = formatted[i];
+      const blocks: Anthropic.ContentBlockParam[] = typeof message.content === 'string'
+        ? [{ type: 'text', text: message.content }]
+        : [...message.content];
+      const last = blocks.length - 1;
+      if (last < 0) continue;
+      blocks[last] = { ...blocks[last], cache_control: cacheControl } as Anthropic.ContentBlockParam;
+      formatted[i] = { ...message, content: blocks };
+      marked++;
+    }
+    return formatted;
   }
 
-  private formatSystem(system: string | SystemPrompt): Anthropic.TextBlockParam[] {
+  private formatSystem(system: string | SystemPrompt, ttl?: CompletionRequest['cacheTtl']): Anthropic.TextBlockParam[] {
+    const cacheControl = cacheControlFor(ttl);
     // Single-string form: cache the whole prompt.
     if (typeof system === 'string') {
-      return [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
+      return [{ type: 'text', text: system, cache_control: cacheControl }];
     }
 
     // Structured form: cache_control marks the END of the cacheable prefix.
     // Stable portion is cached; dynamic portion follows uncached.
     const blocks: Anthropic.TextBlockParam[] = [
-      { type: 'text', text: system.stable, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: system.stable, cache_control: cacheControl },
     ];
     if (system.dynamic && system.dynamic.length > 0) {
       blocks.push({ type: 'text', text: system.dynamic });
@@ -160,13 +222,13 @@ export class AnthropicProvider implements LLMProvider {
     return blocks;
   }
 
-  private formatTools(tools: NonNullable<CompletionRequest['tools']>): Anthropic.Tool[] {
+  private formatTools(tools: NonNullable<CompletionRequest['tools']>, ttl?: CompletionRequest['cacheTtl']): Anthropic.Tool[] {
     return tools.map((tool, index) => ({
       name: tool.name,
       description: tool.description,
       input_schema: tool.input_schema as Anthropic.Tool.InputSchema,
       ...(index === tools.length - 1 && {
-        cache_control: { type: 'ephemeral' as const },
+        cache_control: cacheControlFor(ttl),
       }),
     }));
   }
@@ -175,10 +237,7 @@ export class AnthropicProvider implements LLMProvider {
     return {
       content: response.content as ContentBlock[],
       stopReason: this.mapStopReason(response.stop_reason),
-      usage: {
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
-      },
+      usage: anthropicUsage(response.usage),
       model: response.model,
     };
   }
@@ -257,4 +316,25 @@ export class AnthropicProvider implements LLMProvider {
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
+}
+
+/** Ephemeral cache marker; the 1-hour lifetime is opt-in per request. */
+function cacheControlFor(ttl: CompletionRequest['cacheTtl']): Anthropic.CacheControlEphemeral {
+  return ttl === '1h' ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' };
+}
+
+/**
+ * Anthropic reports cache reads and writes separately from `input_tokens`.
+ * Fold them back in so `inputTokens` is the whole prompt and the cache
+ * figures are subsets of it, matching the OpenAI-style providers.
+ */
+export function anthropicUsage(usage: Anthropic.Usage): CompletionResponse['usage'] {
+  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+  return {
+    inputTokens: usage.input_tokens + cacheRead + cacheWrite,
+    outputTokens: usage.output_tokens,
+    ...(cacheRead > 0 && { cachedInputTokens: cacheRead }),
+    ...(cacheWrite > 0 && { cacheWriteTokens: cacheWrite }),
+  };
 }

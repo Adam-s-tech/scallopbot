@@ -9,10 +9,19 @@ import type { Attachment } from './types.js';
 import { VoiceManager } from '../voice/index.js';
 import { getPendingVoiceAttachments, cleanupVoiceAttachments } from '../voice/attachments.js';
 import { BotConfigManager } from './bot-config.js';
+import { TelegramReplyDraft, type ReplyDraftOptions } from './telegram-draft.js';
 import { resolveTimezone } from '../utils/country-timezone.js';
 import type { ProviderRegistry } from '../providers/registry.js';
 import type { LLMProvider } from '../providers/types.js';
 import type { InterruptQueue } from '../agent/interrupt-queue.js';
+import {
+  GOAL_HELP,
+  formatGoalOutcome,
+  formatGoalStatus,
+  parseGoalCommand,
+  throttledGoalProgress,
+  type GoalModeController,
+} from '../goals/goal-mode.js';
 import type { MessageDeliveryResult } from '../triggers/types.js';
 import {
   parseProactiveReplyAction,
@@ -89,6 +98,8 @@ export interface TelegramChannelOptions {
   ) => ProactiveFeedbackResult | void | Promise<ProactiveFeedbackResult | void>;
   /** Interrupt queue for mid-loop user message injection */
   interruptQueue?: InterruptQueue;
+  /** Goal mode controller for /goal (shared with other channels). */
+  goalMode?: GoalModeController;
 }
 
 export function formatMarkdownToHtml(text: string): string {
@@ -168,6 +179,10 @@ export class TelegramChannel {
   private activeProcessing: Set<string> = new Set(); // Track users with in-flight agent calls
   private userQueues: Map<string, QueuedMessage[]> = new Map(); // Per-user message queue
   private verboseUsers: Set<string> = new Set(); // Track users who want debug output
+  /** The streaming reply draft of each user's running turn. */
+  private liveDrafts = new Map<string, TelegramReplyDraft>();
+  /** Draft timing overrides (tests pin the first-draft threshold to zero). */
+  private draftOptions: Pick<ReplyDraftOptions, 'minFirstChars' | 'firstSendDelayMs' | 'minEditIntervalMs'> = {};
   private contextWarnedTier: Map<string, number> = new Map(); // sessionId -> highest tier threshold already warned
   private voiceManager: VoiceManager | null = null;
   private voiceAvailable = false;
@@ -177,6 +192,7 @@ export class TelegramChannel {
   private providerRegistry: ProviderRegistry | null = null;
   private onUserMessage?: TelegramChannelOptions['onUserMessage'];
   private interruptQueue: InterruptQueue | null = null;
+  private goalMode: GoalModeController | null = null;
   // Buffer for collecting media group photos (multiple photos sent at once).
   // Bounded to prevent OOM if a user spams groups or the process never calls
   // stop(); timers are explicitly cancelled in stop() to avoid firing on a
@@ -205,6 +221,7 @@ export class TelegramChannel {
     this.providerRegistry = options.providerRegistry || null;
     this.onUserMessage = options.onUserMessage;
     this.interruptQueue = options.interruptQueue || null;
+    this.goalMode = options.goalMode ?? null;
 
     this.setupHandlers();
     this.initVoice();
@@ -350,6 +367,8 @@ export class TelegramChannel {
         const sessionId = this.userSessions.get(userId);
         if (sessionId) this.interruptQueue.clear(sessionId);
       }
+      const goalSessionId = this.userSessions.get(userId);
+      if (goalSessionId) this.goalMode?.stop(goalSessionId);
 
       if (wasActive) {
         const queueMsg = queuedCount > 0 ? ` Cleared ${queuedCount} queued message${queuedCount > 1 ? 's' : ''}.` : '';
@@ -403,6 +422,23 @@ export class TelegramChannel {
       }
 
       await this.handleModel(ctx, userId);
+    });
+
+    // /goal <objective> | status | stop — keep working until the goal is verified
+    this.bot.command('goal', async (ctx) => {
+      const userId = ctx.from?.id.toString();
+      if (!userId) return;
+
+      if (!this.isUserAllowed(userId)) {
+        await this.sendUnauthorized(ctx);
+        return;
+      }
+
+      // Fire-and-forget like regular messages: a goal run can take many
+      // turns and /stop must stay responsive.
+      this.handleGoalCommand(ctx, userId, typeof ctx.match === 'string' ? ctx.match : '').catch((err) => {
+        this.logger.error({ userId, error: (err as Error).message }, 'Unhandled error in /goal handler');
+      });
     });
 
     // Handle regular messages
@@ -1014,7 +1050,8 @@ export class TelegramChannel {
       }
 
       // Thinking stays enabled in the agent but is not surfaced to Telegram users
-      const onProgress = this.buildOnProgress(userId, ctx);
+      const draft = this.createReplyDraft(userId, ctx);
+      const onProgress = this.buildOnProgress(userId, ctx, draft);
 
       const shouldStop = () => this.stopRequests.has(userId);
       const providerOverride = this.getProviderForUser(userId);
@@ -1023,7 +1060,7 @@ export class TelegramChannel {
 
       clearInterval(typingInterval);
 
-      await this.sendAgentResponse(ctx, result);
+      await this.sendAgentResponse(ctx, result, draft);
 
       await this.maybeWarnContext(sessionId, ctx, result.tokenUsage.peakInputTokens ?? result.tokenUsage.inputTokens);
 
@@ -1032,6 +1069,7 @@ export class TelegramChannel {
       // replying with voice just because the user sent a voice message.
     } catch (error) {
       clearInterval(typingInterval);
+      await this.discardReplyDraft(userId);
       this.logger.error({ userId, error: (error as Error).message }, 'Failed to process voice message');
       await ctx.reply('Sorry, I had trouble processing your voice message. Please try again or send a text message.');
     }
@@ -1111,7 +1149,8 @@ export class TelegramChannel {
       const sessionId = await this.getOrCreateSession(userId);
 
       // Thinking stays enabled in the agent but is not surfaced to Telegram users
-      const onProgress = this.buildOnProgress(userId, ctx);
+      const draft = this.createReplyDraft(userId, ctx);
+      const onProgress = this.buildOnProgress(userId, ctx, draft);
 
       const shouldStop = () => this.stopRequests.has(userId);
       const providerOverride = this.getProviderForUser(userId);
@@ -1120,13 +1159,14 @@ export class TelegramChannel {
 
       clearInterval(typingInterval);
 
-      await this.sendAgentResponse(ctx, result);
+      await this.sendAgentResponse(ctx, result, draft);
 
       await this.maybeWarnContext(sessionId, ctx, result.tokenUsage.peakInputTokens ?? result.tokenUsage.inputTokens);
 
       this.logger.info({ userId, fileName: document.file_name }, 'Processed document message');
     } catch (error) {
       clearInterval(typingInterval);
+      await this.discardReplyDraft(userId);
       this.logger.error({ userId, error: (error as Error).message }, 'Failed to process document');
       await ctx.reply('Sorry, I had trouble processing that file. Please try again.');
     }
@@ -1300,7 +1340,8 @@ export class TelegramChannel {
       // Process through agent WITH attachments
       const sessionId = await this.getOrCreateSession(userId);
 
-      const onProgress = this.buildOnProgress(userId, ctx);
+      const draft = this.createReplyDraft(userId, ctx);
+      const onProgress = this.buildOnProgress(userId, ctx, draft);
       const shouldStop = () => this.stopRequests.has(userId);
       const providerOverride = this.getProviderForUser(userId);
 
@@ -1309,13 +1350,14 @@ export class TelegramChannel {
 
       clearInterval(typingInterval);
 
-      await this.sendAgentResponse(ctx, result);
+      await this.sendAgentResponse(ctx, result, draft);
 
       await this.maybeWarnContext(sessionId, ctx, result.tokenUsage.peakInputTokens ?? result.tokenUsage.inputTokens);
 
       this.logger.info({ userId, photoCount }, 'Processed photo message with vision');
     } catch (error) {
       clearInterval(typingInterval);
+      await this.discardReplyDraft(userId);
       this.logger.error({ userId, error: (error as Error).message }, 'Failed to process photos');
       await ctx.reply('Sorry, I had trouble processing that photo. Please try again.');
     }
@@ -1430,7 +1472,8 @@ export class TelegramChannel {
 
     try {
       // Thinking stays enabled in the agent but is not surfaced to Telegram users
-      const onProgress = this.buildOnProgress(userId, ctx);
+      const draft = this.createReplyDraft(userId, ctx);
+      const onProgress = this.buildOnProgress(userId, ctx, draft);
 
       // Check if user wants to stop
       const shouldStop = () => this.stopRequests.has(userId);
@@ -1443,7 +1486,7 @@ export class TelegramChannel {
 
       clearInterval(typingInterval);
 
-      await this.sendAgentResponse(ctx, result);
+      await this.sendAgentResponse(ctx, result, draft);
 
       await this.maybeWarnContext(sessionId, ctx, result.tokenUsage.peakInputTokens ?? result.tokenUsage.inputTokens);
 
@@ -1456,6 +1499,7 @@ export class TelegramChannel {
       );
     } catch (error) {
       clearInterval(typingInterval);
+      await this.discardReplyDraft(userId);
       const err = error as Error;
       this.logger.error({ userId, error: err.message }, 'Failed to process message');
       await ctx.reply('Sorry, I encountered an error processing your message. Please try again.');
@@ -1553,11 +1597,87 @@ export class TelegramChannel {
    * When verbose mode is off, returns a no-op. When on, sends formatted debug messages.
    */
   /**
+   * /goal. The run owns the user's processing slot, so messages sent while it
+   * runs steer it through the interrupt queue and /stop ends it. Telegram
+   * gets the first reply (the plan), then at most one progress note every
+   * five minutes, then the final report: one message per turn would flood
+   * a chat for a 30-turn run.
+   */
+  private async handleGoalCommand(ctx: Context, userId: string, args: string): Promise<void> {
+    if (!this.goalMode) {
+      await ctx.reply('Goal mode is not available.');
+      return;
+    }
+    const goalMode = this.goalMode;
+    const sessionId = await this.getOrCreateSession(userId);
+    const command = parseGoalCommand(args);
+
+    if (command.action === 'help') {
+      await ctx.reply(GOAL_HELP);
+      return;
+    }
+    if (command.action === 'status') {
+      await ctx.reply(formatGoalStatus(goalMode.status(sessionId)));
+      return;
+    }
+    if (command.action === 'stop') {
+      await ctx.reply(goalMode.stop(sessionId) ? 'Stopping the goal…' : 'No goal is running.');
+      return;
+    }
+
+    if (goalMode.isRunning(sessionId)) {
+      await ctx.reply(formatGoalStatus(goalMode.status(sessionId)));
+      return;
+    }
+    if (this.activeProcessing.has(userId)) {
+      await ctx.reply('I am still working on your last message. Send /stop or wait, then start the goal.');
+      return;
+    }
+
+    this.activeProcessing.add(userId);
+    this.stopRequests.delete(userId);
+    const typingInterval = this.startTypingIndicator(ctx);
+    try {
+      await ctx.reply(`Goal started: ${command.objective}\nI will keep going until every part is verified. /goal status to check, /goal stop to stop.`);
+      const onProgress = this.buildOnProgress(userId, ctx);
+      const providerOverride = this.getProviderForUser(userId);
+      const run = await goalMode.run(sessionId, command.objective, {
+        userId: `telegram:${userId}`,
+        shouldStop: () => this.stopRequests.has(userId),
+        runTurn: (sid, message, shouldStop) =>
+          this.agent.processMessage(sid, message, undefined, onProgress, shouldStop, providerOverride),
+        onTurn: throttledGoalProgress((text) => this.replyFormatted(ctx, text)),
+      });
+      clearInterval(typingInterval);
+      await this.replyFormatted(ctx, formatGoalOutcome(run));
+      await this.sendPendingVoiceAttachments(ctx, sessionId);
+    } catch (error) {
+      clearInterval(typingInterval);
+      this.logger.error({ userId, error: (error as Error).message }, 'Goal run failed');
+      await ctx.reply(`The goal could not run: ${(error as Error).message.slice(0, 200)}`);
+    } finally {
+      clearInterval(typingInterval);
+      this.stopRequests.delete(userId);
+      // drainQueue releases the processing slot when the queue is empty.
+      await this.drainQueue(userId);
+    }
+  }
+
+  private async replyFormatted(ctx: Context, text: string): Promise<void> {
+    await this.sendAgentResponse(ctx, {
+      response: text,
+      tokenUsage: { inputTokens: 0, outputTokens: 0 },
+      iterationsUsed: 0,
+      completionReason: 'natural_end',
+    });
+  }
+
+  /**
    * Deliver an agent reply in Telegram-sized chunks. When the turn left a
    * blocked write waiting on the user, the approval buttons ride on the last
    * chunk so answering costs one tap.
    */
-  private async sendAgentResponse(ctx: Context, result: AgentResult): Promise<void> {
+  private async sendAgentResponse(ctx: Context, result: AgentResult, draft?: TelegramReplyDraft): Promise<void> {
     const formattedResponse = formatMarkdownToHtml(result.response);
     let chunks = splitMessage(formattedResponse).filter(c => c.trim());
     const pending = result.pendingApproval;
@@ -1565,7 +1685,20 @@ export class TelegramChannel {
       chunks = [formatMarkdownToHtml(pending.question)];
     }
 
-    for (let index = 0; index < chunks.length; index++) {
+    // A streamed draft becomes the first chunk, so the reply is not sent twice.
+    let first = 0;
+    if (draft) {
+      const ownerId = ctx.from?.id.toString();
+      if (ownerId && this.liveDrafts.get(ownerId) === draft) this.liveDrafts.delete(ownerId);
+      if (chunks.length === 0) {
+        await draft.discard();
+      } else {
+        const markup = pending && chunks.length === 1 ? approvalKeyboard(pending.id) : undefined;
+        if (await draft.finalize(chunks[0], markup)) first = 1;
+      }
+    }
+
+    for (let index = first; index < chunks.length; index++) {
       const chunk = chunks[index];
       const isLast = index === chunks.length - 1;
       const options: Parameters<Context['reply']>[1] = pending && isLast
@@ -1643,17 +1776,19 @@ export class TelegramChannel {
     const execute = async (): Promise<void> => {
       const typingInterval = this.startTypingIndicator(ctx);
       try {
-        const onProgress = this.buildOnProgress(userId, ctx);
+        const draft = this.createReplyDraft(userId, ctx);
+        const onProgress = this.buildOnProgress(userId, ctx, draft);
         const shouldStop = () => this.stopRequests.has(userId);
         const providerOverride = this.getProviderForUser(userId);
         const result = await this.agent.processMessage(sessionId, text, undefined, onProgress, shouldStop, providerOverride);
         this.stopRequests.delete(userId);
         clearInterval(typingInterval);
-        await this.sendAgentResponse(ctx, result);
+        await this.sendAgentResponse(ctx, result, draft);
         await this.maybeWarnContext(sessionId, ctx, result.tokenUsage.peakInputTokens ?? result.tokenUsage.inputTokens);
         await this.sendPendingVoiceAttachments(ctx, sessionId);
       } catch (error) {
         clearInterval(typingInterval);
+        await this.discardReplyDraft(userId);
         this.logger.error({ userId, error: (error as Error).message }, 'Failed to process approval turn');
         await ctx.reply('Sorry, I encountered an error processing your message. Please try again.').catch(() => {});
       }
@@ -1700,12 +1835,49 @@ export class TelegramChannel {
     );
   }
 
-  private buildOnProgress(userId: string, ctx: Context): ProgressCallback {
-    if (!this.verboseUsers.has(userId)) {
-      return async () => {};
-    }
+  /** A per-turn streaming draft bound to this chat (see telegram-draft.ts). */
+  private createReplyDraft(userId: string, ctx: Context): TelegramReplyDraft {
+    // Private chats share the user's id; fall back to it when ctx.chat is absent.
+    const chatId = ctx.chat?.id ?? ctx.from!.id;
+    const draft = new TelegramReplyDraft({
+      send: async (text) => (await ctx.reply(text)).message_id,
+      edit: async (messageId, text, options) => {
+        await ctx.api.editMessageText(chatId, messageId, text, {
+          ...(options?.html && { parse_mode: 'HTML' as const }),
+          ...(options?.replyMarkup !== undefined && { reply_markup: options.replyMarkup as InlineKeyboard }),
+        });
+      },
+      delete: async (messageId) => {
+        await ctx.api.deleteMessage(chatId, messageId);
+      },
+    }, { logger: this.logger, ...this.draftOptions });
+    this.liveDrafts.set(userId, draft);
+    return draft;
+  }
+
+  /** The turn failed: take its half-written draft off the screen. */
+  private async discardReplyDraft(userId: string): Promise<void> {
+    const draft = this.liveDrafts.get(userId);
+    if (!draft) return;
+    this.liveDrafts.delete(userId);
+    await draft.discard().catch(() => {});
+  }
+
+  private buildOnProgress(userId: string, ctx: Context, draft?: TelegramReplyDraft): ProgressCallback {
+    const verbose = this.verboseUsers.has(userId);
 
     return async (update) => {
+      // Reply streaming: deltas build the draft; a reset drops planning text.
+      if (update.type === 'text_delta') {
+        draft?.push(update.message);
+        return;
+      }
+      if (update.type === 'text_reset') {
+        draft?.reset();
+        return;
+      }
+      if (!verbose) return;
+
       let text = '';
       const truncate = (s: string, max = 500) => s.length > max ? s.slice(0, max) + '…' : s;
 
@@ -1852,6 +2024,7 @@ export class TelegramChannel {
         { command: 'model', description: 'Switch AI model/provider' },
         { command: 'usage', description: 'View token usage and costs' },
         { command: 'stop', description: 'Stop current task' },
+        { command: 'goal', description: 'Keep working on an objective until it is verified' },
         { command: 'settings', description: 'View your current settings' },
         { command: 'setup', description: 'Reconfigure bot (name, personality, timezone)' },
         { command: 'new', description: 'Start a new conversation' },

@@ -4,11 +4,19 @@ import type {
   CompletionRequest,
   CompletionResponse,
   ContentBlock,
+  StreamHandlers,
 } from './types.js';
 import { flattenSystem } from './types.js';
+import {
+  ChatCompletionStreamAssembler,
+  StreamInterruptedError,
+  parseSSE,
+  trackingHandlers,
+  type ChatCompletionChunkLike,
+} from './streaming.js';
 import { DEFAULT_MAX_RETRIES, RETRY_DELAY_MS } from './constants.js';
 
-const DEFAULT_MODEL = 'anthropic/claude-3.5-sonnet';
+const DEFAULT_MODEL = 'anthropic/claude-sonnet-5.5';
 const API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 /** Models that support extended thinking/reasoning via OpenRouter */
@@ -217,7 +225,8 @@ export class OpenRouterProvider implements LLMProvider {
     return parts;
   }
 
-  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+  /** The request body shared by complete() and completeStream(). */
+  private buildBody(request: CompletionRequest): Record<string, unknown> {
     const messages = this.formatMessages(request);
     const isReasoning = this.isReasoningModel();
 
@@ -226,12 +235,14 @@ export class OpenRouterProvider implements LLMProvider {
       messages,
       max_tokens: isReasoning ? (request.maxTokens || 8192) : (request.maxTokens || 4096),
       usage: { include: true },
+      // Sticky routing: requests sharing a key reuse the same upstream cache.
+      ...(request.cacheKey && { prompt_cache_key: request.cacheKey }),
       // OpenRouter otherwise infers reasoning from the model. An explicit
       // false is a hard route contract for schema-only background work; the
       // effort used for "off" is per-model (see reasoningOffEffortForModel).
       ...(request.enableThinking !== undefined && {
         reasoning: request.enableThinking
-          ? { effort: 'high' }
+          ? { effort: request.reasoningEffort ?? 'high' }
           : { effort: reasoningOffEffortForModel(this.model), exclude: true },
       }),
     };
@@ -266,6 +277,12 @@ export class OpenRouterProvider implements LLMProvider {
       };
     }
 
+    return body;
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    const body = this.buildBody(request);
+
     const { response, bodyData, bodyError } = await this.executeWithRetry(
       (signal) =>
         fetch(API_URL, {
@@ -294,6 +311,83 @@ export class OpenRouterProvider implements LLMProvider {
     if (bodyError !== undefined) throw bodyError;
     const data = bodyData as OpenRouterResponse;
     return this.formatResponse(data);
+  }
+
+  /**
+   * Streamed completion over SSE. The body is complete()'s plus the stream
+   * flags; usage arrives in the final chunk (include_usage). The whole stream
+   * runs inside one attempt, so the provider timeout bounds it like a
+   * buffered body. Retries happen only before the first visible delta.
+   */
+  async completeStream(request: CompletionRequest, handlers: StreamHandlers): Promise<CompletionResponse> {
+    const body = {
+      ...this.buildBody(request),
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+    const tracked = trackingHandlers(handlers);
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      try {
+        const outcome = await this.executeAttempt(async (signal) => {
+          const response = await fetch(API_URL, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${this.apiKey}`,
+              'HTTP-Referer': this.siteUrl,
+              'X-Title': this.siteName,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+            ...(signal ? { signal } : {}),
+          });
+          if (response.status === 429) return { response };
+          if (!response.ok || !response.body) {
+            const errorData = await response.json().catch(() => ({}));
+            throw Object.assign(
+              new Error(`OpenRouter API error: ${response.status} ${response.statusText} - ${JSON.stringify(errorData)}`),
+              { status: response.status, nonRetryable: true },
+            );
+          }
+          const assembler = new ChatCompletionStreamAssembler(tracked.handlers, { keepReasoning: true });
+          for await (const data of parseSSE(response.body)) {
+            let chunk: ChatCompletionChunkLike;
+            try {
+              chunk = JSON.parse(data) as ChatCompletionChunkLike;
+            } catch {
+              continue;
+            }
+            assembler.push(chunk);
+          }
+          return { response, completion: assembler.result() };
+        }, request.signal);
+
+        if (outcome.response.status === 429 || !outcome.completion) {
+          const retryAfter = outcome.response.headers.get('retry-after');
+          const retryAfterSecs = retryAfter ? parseInt(retryAfter, 10) : NaN;
+          await this.delay(
+            !isNaN(retryAfterSecs) ? retryAfterSecs * 1000 : RETRY_DELAY_MS * Math.pow(2, attempt),
+            request.signal,
+          );
+          continue;
+        }
+        return this.formatResponse(outcome.completion as unknown as OpenRouterResponse);
+      } catch (error) {
+        lastError = error as Error;
+        if (
+          request.signal?.aborted
+          || this.isAbortOrTimeoutError(error)
+          || (error as { nonRetryable?: boolean }).nonRetryable
+        ) {
+          throw error;
+        }
+        if (tracked.delivered()) throw new StreamInterruptedError(error);
+        await this.delay(RETRY_DELAY_MS * Math.pow(2, attempt), request.signal);
+      }
+    }
+
+    throw lastError || new Error('Max retries exceeded');
   }
 
   private formatMessages(request: CompletionRequest): OpenRouterMessage[] {

@@ -57,13 +57,13 @@ function parseCostModelPricingEnv(): Record<string, z.infer<typeof modelPricingS
 // Provider configuration schemas
 const anthropicProviderSchema = z.object({
   apiKey: z.string().default(''),
-  model: z.string().default('claude-sonnet-4-20250514'),
+  model: z.string().default('claude-sonnet-5-5'),
 });
 
 const openaiProviderSchema = z.object({
   apiKey: z.string().default(''),
   baseUrl: z.string().optional(),
-  model: z.string().default('gpt-4.1'),
+  model: z.string().default('gpt-5.6-luna'),
 });
 
 const groqProviderSchema = z.object({
@@ -78,12 +78,12 @@ const ollamaProviderSchema = z.object({
 
 const openrouterProviderSchema = z.object({
   apiKey: z.string().default(''),
-  model: z.string().default('anthropic/claude-3.5-sonnet'),
+  model: z.string().default('anthropic/claude-sonnet-5.5'),
 });
 
 const moonshotProviderSchema = z.object({
   apiKey: z.string().default(''),
-  model: z.string().default('kimi-k2.5'),
+  model: z.string().default('kimi-k3'),
   /** Enable extended thinking mode for Kimi K2.5 (uses more tokens, better reasoning) */
   enableThinking: z.boolean().default(true),
 });
@@ -95,11 +95,11 @@ const xaiProviderSchema = z.object({
 
 const providersSchema = z.object({
   anthropic: anthropicProviderSchema,
-  openai: openaiProviderSchema.default({ apiKey: '', model: 'gpt-4o' }),
+  openai: openaiProviderSchema.default({ apiKey: '', model: 'gpt-5.6-luna' }),
   groq: groqProviderSchema.default({ apiKey: '', model: 'llama-3.3-70b-versatile' }),
   ollama: ollamaProviderSchema.default({ baseUrl: DEFAULT_OLLAMA_BASE_URL, model: 'llama3.2' }),
-  openrouter: openrouterProviderSchema.default({ apiKey: '', model: 'anthropic/claude-3.5-sonnet' }),
-  moonshot: moonshotProviderSchema.default({ apiKey: '', model: 'kimi-k2.5', enableThinking: true }),
+  openrouter: openrouterProviderSchema.default({ apiKey: '', model: 'anthropic/claude-sonnet-5.5' }),
+  moonshot: moonshotProviderSchema.default({ apiKey: '', model: 'kimi-k3', enableThinking: true }),
   xai: xaiProviderSchema.default({ apiKey: '', model: 'grok-4' }),
 });
 
@@ -196,6 +196,8 @@ const agentSchema = z.object({
   // operator-configured hard cap; normal turns are governed by per-call and
   // progress-aware safeguards instead of a cumulative wall-clock deadline.
   turnTimeoutMs: z.number().int().min(0).max(900_000).default(0),
+  // /goal runs stop after this many agent turns (GOAL_MAX_TURNS).
+  goalMaxTurns: z.number().int().positive().max(1_000).default(30),
 });
 
 // Logging configuration schema
@@ -244,6 +246,12 @@ const memorySchema = z.object({
   mmrEnabled: z.boolean().default(false),
   /** MMR lambda: balance between relevance (1.0) and diversity (0.0) */
   mmrLambda: z.number().min(0).max(1).default(0.7),
+  /**
+   * LLM-rerank foreground recall (MEMORY_FOREGROUND_RERANK). Off by default:
+   * foreground search is BM25 + embeddings (+graph) fusion only, so no LLM call
+   * sits before the reply. Background jobs opt in per call.
+   */
+  foregroundRerank: z.boolean().default(false),
 });
 
 // Tool policy configuration schema
@@ -292,22 +300,25 @@ const tailscaleSchema = z.object({
 
 // Sub-agent configuration schema
 const subagentSchema = z.object({
-  maxConcurrentPerSession: z.number().int().positive().default(3),
-  maxConcurrentGlobal: z.number().int().positive().default(5),
-  maxSpawnDepth: z.number().int().min(0).max(5).default(1),
+  maxConcurrentPerSession: z.number().int().positive().default(8),
+  maxConcurrentGlobal: z.number().int().positive().default(24),
+  /** Sub-agent nesting below a top-level session: 2 = children + grandchildren. */
+  maxSpawnDepth: z.number().int().min(0).max(5).default(2),
   defaultTimeoutSeconds: z.number().int().min(0).default(0),
   maxTimeoutSeconds: z.number().int().positive().default(3600),
   defaultIdleTimeoutSeconds: z.number().int().positive().default(300),
   maxIdleTimeoutSeconds: z.number().int().positive().default(1800),
-  defaultModelTier: z.enum(['fast', 'standard', 'capable']).default('fast'),
-  maxIterations: z.number().int().positive().default(20),
-  maxInputTokens: z.number().int().positive().default(80_000),
+  defaultModelTier: z.enum(['fast', 'standard', 'capable']).default('standard'),
+  maxIterations: z.number().int().positive().default(60),
+  maxInputTokens: z.number().int().positive().default(4_000_000),
   maxCostUsdPerRun: z.number().positive().default(2),
-  maxSummaryChars: z.number().int().positive().default(12_000),
+  maxSummaryChars: z.number().int().positive().default(24_000),
   defaultContextMode: z.enum(['isolated', 'brief', 'fork']).default('brief'),
   cleanupAfterSeconds: z.number().int().positive().default(3600),
   diagnosticRetentionSeconds: z.number().int().positive().default(30 * 24 * 60 * 60),
   allowMemoryWrites: z.boolean().default(false),
+  progressNoteIntervalSeconds: z.number().int().min(0).default(30),
+  forwardProgressNotes: z.boolean().default(true),
 });
 
 // Per-purpose model routing schema (single place each LLM job picks its model).
@@ -445,7 +456,7 @@ export const configSchema = z.object({
   cost: costSchema.default({ warningThreshold: 0.75, customPricing: {} }),
   eventRelay: eventRelaySchema.default({ webhookTimeoutMs: 5000, agentId: 'scallopbot' }),
   context: contextSchema.default({ hotWindowSize: 200, maxContextTokens: 128000, compressionThreshold: 0.7, maxToolOutputBytes: 30000 }),
-  memory: memorySchema.default({ filePath: 'memories.jsonl', persist: true, dbPath: 'memories.db', mmrEnabled: false, mmrLambda: 0.7 }),
+  memory: memorySchema.default({ filePath: 'memories.jsonl', persist: true, dbPath: 'memories.db', mmrEnabled: false, mmrLambda: 0.7, foregroundRerank: false }),
   tools: toolPolicySchema.default({
     loopDetection: {
       maxCallsPerResponse: 64,
@@ -458,22 +469,24 @@ export const configSchema = z.object({
   gateway: gatewaySchema.default({ port: DEFAULT_API_PORT, host: DEFAULT_HOST }),
   tailscale: tailscaleSchema.default({ mode: 'off', resetOnExit: true }),
   subagent: subagentSchema.default({
-    maxConcurrentPerSession: 3,
-    maxConcurrentGlobal: 5,
-    maxSpawnDepth: 1,
+    maxConcurrentPerSession: 8,
+    maxConcurrentGlobal: 24,
+    maxSpawnDepth: 2,
     defaultTimeoutSeconds: 0,
     maxTimeoutSeconds: 3600,
     defaultIdleTimeoutSeconds: 300,
     maxIdleTimeoutSeconds: 1800,
-    defaultModelTier: 'fast' as const,
-    maxIterations: 20,
-    maxInputTokens: 80_000,
+    defaultModelTier: 'standard' as const,
+    maxIterations: 60,
+    maxInputTokens: 4_000_000,
     maxCostUsdPerRun: 2,
-    maxSummaryChars: 12_000,
+    maxSummaryChars: 24_000,
     defaultContextMode: 'brief' as const,
     cleanupAfterSeconds: 3600,
     diagnosticRetentionSeconds: 30 * 24 * 60 * 60,
     allowMemoryWrites: false,
+    progressNoteIntervalSeconds: 30,
+    forwardProgressNotes: true,
   }),
 });
 
@@ -526,6 +539,9 @@ export function loadConfig(): Config {
   const turnTimeoutMs = process.env.AGENT_TURN_TIMEOUT_MS
     ? parseInt(process.env.AGENT_TURN_TIMEOUT_MS, 10)
     : 0;
+  const goalMaxTurns = process.env.GOAL_MAX_TURNS
+    ? parseInt(process.env.GOAL_MAX_TURNS, 10)
+    : 30;
   const logLevel = process.env.LOG_LEVEL || 'info';
   const parsePolicyJson = (name: string): unknown => {
     const raw = process.env[name];
@@ -649,12 +665,12 @@ export function loadConfig(): Config {
     providers: {
       anthropic: {
         apiKey: anthropicApiKey,
-        model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
+        model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5',
       },
       openai: {
         apiKey: openaiApiKey || '',
         baseUrl: process.env.OPENAI_BASE_URL || undefined,
-        model: process.env.OPENAI_MODEL || 'gpt-4o',
+        model: process.env.OPENAI_MODEL || 'gpt-5.6-luna',
       },
       groq: {
         apiKey: groqApiKey || '',
@@ -666,11 +682,11 @@ export function loadConfig(): Config {
       },
       openrouter: {
         apiKey: openrouterApiKey || '',
-        model: process.env.OPENROUTER_MODEL || 'anthropic/claude-3.5-sonnet',
+        model: process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-5.5',
       },
       moonshot: {
         apiKey: process.env.MOONSHOT_API_KEY || '',
-        model: process.env.MOONSHOT_MODEL || 'kimi-k2.5',
+        model: process.env.MOONSHOT_MODEL || 'kimi-k3',
         enableThinking: process.env.KIMI_THINKING_ENABLED !== 'false',
       },
       xai: {
@@ -734,6 +750,7 @@ export function loadConfig(): Config {
       maxIterations,
       foregroundCallTimeoutMs,
       turnTimeoutMs,
+      goalMaxTurns,
     },
     logging: {
       level: logLevel,
@@ -774,6 +791,7 @@ export function loadConfig(): Config {
       dbPath: process.env.MEMORY_DB_PATH || 'memories.db',
       mmrEnabled: process.env.MMR_ENABLED === 'true',
       mmrLambda: process.env.MMR_LAMBDA ? parseFloat(process.env.MMR_LAMBDA) : 0.7,
+      foregroundRerank: process.env.MEMORY_FOREGROUND_RERANK === 'true',
     },
     tools: {
       policy: parsePolicyJson('TOOL_POLICY_JSON'),
@@ -797,24 +815,26 @@ export function loadConfig(): Config {
       resetOnExit: process.env.TAILSCALE_RESET_ON_EXIT !== 'false',
     },
     subagent: {
-      maxConcurrentPerSession: process.env.SUBAGENT_MAX_CONCURRENT_PER_SESSION ? parseInt(process.env.SUBAGENT_MAX_CONCURRENT_PER_SESSION, 10) : 3,
-      maxConcurrentGlobal: process.env.SUBAGENT_MAX_CONCURRENT_GLOBAL ? parseInt(process.env.SUBAGENT_MAX_CONCURRENT_GLOBAL, 10) : 5,
-      maxSpawnDepth: envInt('SUBAGENT_MAX_SPAWN_DEPTH', 1),
+      maxConcurrentPerSession: process.env.SUBAGENT_MAX_CONCURRENT_PER_SESSION ? parseInt(process.env.SUBAGENT_MAX_CONCURRENT_PER_SESSION, 10) : 8,
+      maxConcurrentGlobal: process.env.SUBAGENT_MAX_CONCURRENT_GLOBAL ? parseInt(process.env.SUBAGENT_MAX_CONCURRENT_GLOBAL, 10) : 24,
+      maxSpawnDepth: envInt('SUBAGENT_MAX_SPAWN_DEPTH', 2),
       defaultTimeoutSeconds: envInt('SUBAGENT_DEFAULT_TIMEOUT', 0),
       maxTimeoutSeconds: envInt('SUBAGENT_MAX_TIMEOUT', 3600),
       defaultIdleTimeoutSeconds: envInt('SUBAGENT_IDLE_TIMEOUT', 300),
       maxIdleTimeoutSeconds: envInt('SUBAGENT_MAX_IDLE_TIMEOUT', 1800),
-      defaultModelTier: (process.env.SUBAGENT_MODEL_TIER as 'fast' | 'standard' | 'capable') || 'fast',
-      maxIterations: process.env.SUBAGENT_MAX_ITERATIONS ? parseInt(process.env.SUBAGENT_MAX_ITERATIONS, 10) : 20,
-      maxInputTokens: envInt('SUBAGENT_MAX_INPUT_TOKENS', 80_000),
+      defaultModelTier: (process.env.SUBAGENT_MODEL_TIER as 'fast' | 'standard' | 'capable') || 'standard',
+      maxIterations: process.env.SUBAGENT_MAX_ITERATIONS ? parseInt(process.env.SUBAGENT_MAX_ITERATIONS, 10) : 60,
+      maxInputTokens: envInt('SUBAGENT_MAX_INPUT_TOKENS', 4_000_000),
       maxCostUsdPerRun: envFloat('SUBAGENT_MAX_COST_USD', 2),
-      maxSummaryChars: envInt('SUBAGENT_MAX_SUMMARY_CHARS', 12_000),
+      maxSummaryChars: envInt('SUBAGENT_MAX_SUMMARY_CHARS', 24_000),
       defaultContextMode: (process.env.SUBAGENT_CONTEXT_MODE as 'isolated' | 'brief' | 'fork') || 'brief',
       cleanupAfterSeconds: process.env.SUBAGENT_CLEANUP_AFTER ? parseInt(process.env.SUBAGENT_CLEANUP_AFTER, 10) : 3600,
       diagnosticRetentionSeconds: process.env.SUBAGENT_DIAGNOSTIC_RETENTION
         ? parseInt(process.env.SUBAGENT_DIAGNOSTIC_RETENTION, 10)
         : 30 * 24 * 60 * 60,
       allowMemoryWrites: process.env.SUBAGENT_ALLOW_MEMORY_WRITES === 'true',
+      progressNoteIntervalSeconds: envInt('SUBAGENT_PROGRESS_NOTE_INTERVAL', 30),
+      forwardProgressNotes: process.env.SUBAGENT_FORWARD_PROGRESS !== 'false',
     },
   };
 

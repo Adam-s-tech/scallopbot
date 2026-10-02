@@ -5,8 +5,15 @@ import type {
   CompletionRequest,
   CompletionResponse,
   ContentBlock,
+  StreamHandlers,
 } from './types.js';
 import { flattenSystem } from './types.js';
+import {
+  ChatCompletionStreamAssembler,
+  StreamInterruptedError,
+  trackingHandlers,
+  type ChatCompletionChunkLike,
+} from './streaming.js';
 import { DEFAULT_MAX_RETRIES, RETRY_STATUS_CODES, RETRY_DELAY_MS } from './constants.js';
 import { buildCredentialPool, type CredentialPool } from './credential-pool.js';
 
@@ -35,7 +42,7 @@ export const OPENAI_MODELS = {
 /** Models that support reasoning_effort parameter */
 const REASONING_MODELS = new Set(['gpt-5.2', 'gpt-5.2-pro', 'o3', 'o4-mini']);
 
-const DEFAULT_MODEL = 'gpt-4.1';
+const DEFAULT_MODEL = 'gpt-5.6-luna';
 // Bumped from 4096 so thinking-heavy models (qwen3.6 on Dell) don't burn the whole
 // budget on reasoning_content and return empty visible output. 8192 leaves room for
 // ~4k thinking + ~4k actual reply.
@@ -91,16 +98,33 @@ export class OpenAIProvider implements LLMProvider {
     });
   }
 
+  /**
+   * Bench the active key and switch to the next one in the pool. Used by the
+   * agent's recovery ladder for rate-limit, auth and quota errors. Returns
+   * false when there is no other key to switch to.
+   */
+  rotateCredential(): boolean {
+    if (!this.credentialPool?.canRotate()) return false;
+    this.credentialPool.reportFailure(this.apiKey);
+    const nextKey = this.credentialPool.next();
+    if (nextKey === this.apiKey) return false;
+    this.apiKey = nextKey;
+    this.client = this.buildClient(nextKey);
+    return true;
+  }
+
   isAvailable(): boolean {
     if (this.credentialPool) return this.credentialPool.availableCount() > 0;
     return !!this.apiKey && this.apiKey.length > 0;
   }
 
-  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+  /** The request params shared by complete() and completeStream(). */
+  private buildParams(request: CompletionRequest): OpenAI.ChatCompletionCreateParamsNonStreaming {
     const messages = this.formatMessages(request);
-    const isReasoning = REASONING_MODELS.has(this.model);
+    // Every GPT-5.x and o-series model takes max_completion_tokens and no temperature.
+    const isReasoning = REASONING_MODELS.has(this.model) || /^(?:gpt-5|o\d)/.test(this.model);
 
-    const params: OpenAI.ChatCompletionCreateParams = {
+    return {
       model: this.model,
       messages,
       // Reasoning models use max_completion_tokens instead of max_tokens
@@ -111,6 +135,9 @@ export class OpenAIProvider implements LLMProvider {
       ...(request.temperature !== undefined && !isReasoning && { temperature: request.temperature }),
       ...(request.stopSequences && { stop: request.stopSequences }),
       ...(request.tools && { tools: this.formatTools(request.tools) }),
+      // Keyed caching keeps one conversation on one cache shard. Only the
+      // first-party API knows the field; compatible servers may reject it.
+      ...(request.cacheKey && !this.baseUrl && { prompt_cache_key: request.cacheKey }),
       ...(request.structuredOutput && {
         response_format: {
           type: 'json_schema' as const,
@@ -126,9 +153,13 @@ export class OpenAIProvider implements LLMProvider {
       // strict background routes pass false and get a deterministic no-reasoning
       // request instead.
       ...(isReasoning && request.enableThinking !== undefined && {
-        reasoning_effort: request.enableThinking ? 'high' : 'none',
+        reasoning_effort: request.enableThinking ? (request.reasoningEffort ?? 'high') : 'none',
       }),
     };
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    const params = this.buildParams(request);
 
     const response = await this.executeWithRetry(() =>
       request.signal
@@ -137,6 +168,38 @@ export class OpenAIProvider implements LLMProvider {
     );
 
     return this.formatResponse(response);
+  }
+
+  /**
+   * Streamed completion via the SDK: complete()'s params plus the stream
+   * flags. Usage comes in the final chunk (include_usage). Key rotation and
+   * retries apply only until the first visible delta.
+   */
+  async completeStream(request: CompletionRequest, handlers: StreamHandlers): Promise<CompletionResponse> {
+    const params: OpenAI.ChatCompletionCreateParamsStreaming = {
+      ...this.buildParams(request),
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+    const tracked = trackingHandlers(handlers);
+
+    const completion = await this.executeWithRetry(async () => {
+      const assembler = new ChatCompletionStreamAssembler(tracked.handlers);
+      try {
+        const stream = request.signal
+          ? await this.client.chat.completions.create(params, { signal: request.signal })
+          : await this.client.chat.completions.create(params);
+        for await (const chunk of stream) {
+          assembler.push(chunk as ChatCompletionChunkLike);
+        }
+      } catch (error) {
+        if (tracked.delivered()) throw new StreamInterruptedError(error);
+        throw error;
+      }
+      return assembler.result();
+    });
+
+    return this.formatResponse(completion as unknown as OpenAI.ChatCompletion);
   }
 
   private formatMessages(
@@ -264,6 +327,7 @@ export class OpenAIProvider implements LLMProvider {
     // Extract reasoning tokens if present (GPT-5.2, o3, o4-mini)
     const completionDetails = response.usage?.completion_tokens_details as
       | { reasoning_tokens?: number } | undefined;
+    const cachedInputTokens = response.usage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content,
@@ -271,6 +335,7 @@ export class OpenAIProvider implements LLMProvider {
       usage: {
         inputTokens: response.usage?.prompt_tokens || 0,
         outputTokens: response.usage?.completion_tokens || 0,
+        ...(cachedInputTokens ? { cachedInputTokens } : {}),
         ...(completionDetails?.reasoning_tokens && {
           reasoningTokens: completionDetails.reasoning_tokens,
         }),

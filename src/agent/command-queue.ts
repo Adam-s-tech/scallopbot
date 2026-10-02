@@ -92,6 +92,21 @@ export function laneHasPending(lane: string): boolean {
 }
 
 /**
+ * Check if a lane is running a task or has queued work.
+ */
+export function laneIsBusy(lane: string): boolean {
+  const state = lanes.get(lane);
+  return !!state && (state.active || state.queue.length > 0);
+}
+
+/**
+ * Check if a lane is running a task right now (e.g. a session turn is in flight).
+ */
+export function laneIsActive(lane: string): boolean {
+  return lanes.get(lane)?.active === true;
+}
+
+/**
  * Get the number of pending tasks in a lane.
  */
 export function laneQueueSize(lane: string): number {

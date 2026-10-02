@@ -20,6 +20,7 @@ import { ContextManager } from '../routing/context.js';
 import { Router } from '../routing/router.js';
 import { CostTracker } from '../routing/cost.js';
 import { LLMFactExtractor } from '../memory/fact-extractor.js';
+import { registerAgentTools } from '../tools/index.js';
 import { createSkillRegistry, type SkillRegistry } from '../skills/registry.js';
 import { createSkillExecutor } from '../skills/executor.js';
 import type {
@@ -313,6 +314,9 @@ export async function createE2EGateway(
   // 10. Create SkillRegistry (empty workspace, no skills loaded from disk)
   const skillRegistry = createSkillRegistry('/tmp', testLogger);
   await skillRegistry.initialize();
+  // Native tools the gateway registers (bash/process, todo, webfetch/web_search).
+  registerAgentTools(skillRegistry, { files: { checkpoints: false, lint: false } });
+  // Native file tools (read_file/write_file/patch/edit_file/undo), as the gateway registers them.
 
   // 11. Create SkillExecutor
   const skillExecutor = createSkillExecutor(testLogger);

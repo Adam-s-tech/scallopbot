@@ -41,6 +41,7 @@ import {
 } from '../security/evidence-grounding.js';
 import { sourceMemoryFingerprint } from './source-fingerprint.js';
 import { LEGACY_EMBEDDING_DIMENSION, LEGACY_EMBEDDING_KEY } from './embedding-config.js';
+import { searchableMessageText } from '../context/message-text.js';
 
 const PERSISTED_MESSAGE_KIND_SQL = PERSISTED_SESSION_MESSAGE_KINDS
   .map(kind => `'${kind}'`)
@@ -377,6 +378,24 @@ export interface SessionLifecycleEventRow {
 /**
  * Session message entry
  */
+/** Agent-created recurring wake-up (heartbeats table). */
+export interface HeartbeatRow {
+  id: string;
+  sessionId: string;
+  userId: string | null;
+  instruction: string;
+  intervalMinutes: number;
+  mode: 'steer' | 'follow_up';
+  enabled: boolean;
+  nextFireAt: number;
+  lastFiredAt: number | null;
+  fireCount: number;
+  lastOutcome: string | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface SessionMessageRow {
   id: number;
   sessionId: string;
@@ -474,6 +493,8 @@ export interface CostUsageRow {
   outputTokens: number;
   cost: number;
   timestamp: number;
+  /** Why the call was made (CompletionRequest.purpose); null for legacy rows and untagged calls. */
+  purpose?: string | null;
 }
 
 // ============ Unified Scheduled Items (Triggers + Reminders) ============
@@ -892,6 +913,44 @@ interface SqliteTableColumn {
 /**
  * SQLite Database Manager for ScallopMemory
  */
+export interface CoreMemoryHistoryRow {
+  id: number;
+  userId: string;
+  block: string;
+  action: string;
+  before: string[];
+  after: string[];
+  source: string | null;
+  reason: string | null;
+  at: number;
+  rolledBack: boolean;
+}
+
+function parseCoreMemoryEntries(raw: unknown): string[] {
+  if (typeof raw !== 'string') return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToCoreMemoryHistory(row: Record<string, unknown>): CoreMemoryHistoryRow {
+  return {
+    id: Number(row.id),
+    userId: String(row.user_id),
+    block: String(row.block),
+    action: String(row.action),
+    before: parseCoreMemoryEntries(row.before_entries),
+    after: parseCoreMemoryEntries(row.after_entries),
+    source: (row.source as string | null) ?? null,
+    reason: (row.reason as string | null) ?? null,
+    at: Number(row.at),
+    rolledBack: Number(row.rolled_back) === 1,
+  };
+}
+
 export class ScallopDatabase {
   private db: Database.Database;
   private dbPath: string;
@@ -1738,12 +1797,147 @@ export class ScallopDatabase {
     this.migrateAddSessionLifecycleColumns();
     this.migrateSubAgentOrchestration();
 
+    // Migration: agent-created heartbeats (additive table).
+    this.migrateCreateHeartbeats();
+
     // Migration: Index embeddings written before the bounded semantic index
     // existed. This is a one-time startup cost; normal writes stay indexed.
     this.migrateBackfillEmbeddingLsh();
 
     // Migration: tag each stored vector with the embedding space it came from.
     this.migrateAddEmbeddingModelColumns();
+
+    // Migration: record why each LLM call was made (nullable, additive).
+    this.migrateAddCostUsagePurpose();
+
+    // Migration: curated per-user core memory blocks (additive).
+    this.migrateAddCoreMemory();
+
+    // Migration: lean compaction state + session_search FTS index (Phase 4).
+    this.migrateCreateSessionCompactions();
+    this.migrateCreateSessionSearchIndex();
+  }
+
+  /** Add the nullable `purpose` column to cost_usage. Legacy rows stay NULL. */
+  private migrateAddCostUsagePurpose(): void {
+    try {
+      const columns = new Set(
+        (this.db.prepare('PRAGMA table_info(cost_usage)').all() as SqliteTableColumn[])
+          .map(column => column.name),
+      );
+      if (!columns.has('purpose')) {
+        this.db.exec('ALTER TABLE cost_usage ADD COLUMN purpose TEXT');
+      }
+    } catch (error) {
+      if (error instanceof Error) {
+        console.warn(`[migration] migrateAddCostUsagePurpose: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Core memory: two small curated blocks per user ('user', 'environment')
+   * frozen into the session prompt, plus an append-only edit history that
+   * makes every write roll-back-able by id.
+   */
+  private migrateAddCoreMemory(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS core_memory_blocks (
+        user_id TEXT NOT NULL,
+        block TEXT NOT NULL,
+        entries TEXT NOT NULL DEFAULT '[]',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, block)
+      );
+      CREATE TABLE IF NOT EXISTS core_memory_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        block TEXT NOT NULL,
+        action TEXT NOT NULL,
+        before_entries TEXT NOT NULL,
+        after_entries TEXT NOT NULL,
+        source TEXT,
+        reason TEXT,
+        at INTEGER NOT NULL,
+        rolled_back INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_core_memory_history_user
+        ON core_memory_history(user_id, at DESC);
+    `);
+  }
+
+  // ============ Core Memory ============
+
+  /** Current entries of one core-memory block (empty when never written). */
+  getCoreMemoryEntries(userId: string, block: string): string[] {
+    const row = this.db.prepare(
+      'SELECT entries FROM core_memory_blocks WHERE user_id = ? AND block = ?',
+    ).get(userId, block) as { entries: string } | undefined;
+    return row ? parseCoreMemoryEntries(row.entries) : [];
+  }
+
+  /**
+   * Replace a block's entries and append a history row in one transaction.
+   * `expectedBefore`, when given, makes the write a compare-and-swap: it throws
+   * if the block changed since the caller read it. Returns the history id.
+   */
+  writeCoreMemoryEntries(input: {
+    userId: string;
+    block: string;
+    entries: string[];
+    action: string;
+    source?: string | null;
+    reason?: string | null;
+    at?: number;
+    expectedBefore?: string[];
+  }): number {
+    const at = input.at ?? Date.now();
+    const write = this.db.transaction(() => {
+      const before = this.getCoreMemoryEntries(input.userId, input.block);
+      if (input.expectedBefore
+        && JSON.stringify(before) !== JSON.stringify(input.expectedBefore)) {
+        throw new Error('core memory changed concurrently; re-read and retry');
+      }
+      this.db.prepare(`
+        INSERT INTO core_memory_blocks (user_id, block, entries, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, block) DO UPDATE SET entries = excluded.entries, updated_at = excluded.updated_at
+      `).run(input.userId, input.block, JSON.stringify(input.entries), at);
+      const history = this.db.prepare(`
+        INSERT INTO core_memory_history
+          (user_id, block, action, before_entries, after_entries, source, reason, at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.userId,
+        input.block,
+        input.action,
+        JSON.stringify(before),
+        JSON.stringify(input.entries),
+        input.source ?? null,
+        input.reason ?? null,
+        at,
+      );
+      return Number(history.lastInsertRowid);
+    });
+    return write();
+  }
+
+  /** Newest-first edit history for a user's core memory. */
+  getCoreMemoryHistory(userId: string, limit = 50): CoreMemoryHistoryRow[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM core_memory_history WHERE user_id = ? ORDER BY id DESC LIMIT ?
+    `).all(userId, limit) as Record<string, unknown>[];
+    return rows.map(rowToCoreMemoryHistory);
+  }
+
+  getCoreMemoryHistoryEntry(id: number): CoreMemoryHistoryRow | null {
+    const row = this.db.prepare('SELECT * FROM core_memory_history WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? rowToCoreMemoryHistory(row) : null;
+  }
+
+  markCoreMemoryHistoryRolledBack(id: number): void {
+    this.db.prepare('UPDATE core_memory_history SET rolled_back = 1 WHERE id = ?').run(id);
   }
 
   /**
@@ -5327,6 +5521,8 @@ export class ScallopDatabase {
       const messageCount = Number(row.message_count ?? 0);
       this.db.prepare('DELETE FROM session_messages WHERE session_id = ?').run(id);
       this.db.prepare('DELETE FROM session_message_archive WHERE session_id = ?').run(id);
+      // A forgotten transcript must not survive in its compaction summary.
+      this.db.prepare('DELETE FROM session_compactions WHERE session_id = ?').run(id);
       this.db.prepare(`
         UPDATE sessions
         SET archived_at = COALESCE(archived_at, ?),
@@ -5465,6 +5661,7 @@ export class ScallopDatabase {
     const result = stmt.run(sessionId, role, content, resolvedKind, now);
     // Update session updated_at
     this.db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, sessionId);
+    this.indexSessionMessageForSearch(Number(result.lastInsertRowid), sessionId, role, content, resolvedKind);
     return {
       id: Number(result.lastInsertRowid), sessionId, role, content,
       messageKind: resolvedKind, createdAt: now,
@@ -5480,6 +5677,339 @@ export class ScallopDatabase {
     `);
     const rows = stmt.all(sessionId) as Record<string, unknown>[];
     return rows.map(row => this.rowToSessionMessage(row));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lean compaction state + session_search index (Phase 4)
+  // ---------------------------------------------------------------------------
+
+  /** One row per session, updated in place on every compaction. */
+  private migrateCreateSessionCompactions(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS session_compactions (
+        session_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        summary_message TEXT NOT NULL,
+        compaction_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+  }
+
+  /**
+   * FTS5 + BM25 index over session messages for the session_search tool.
+   * rowid = message id (hot or archived). Rows are indexed on insert by
+   * addSessionMessage; pre-existing rows are backfilled lazily in batches.
+   * Delete triggers keep the index in sync: a hot row that was moved to the
+   * cold archive stays indexed until the archive row is removed too.
+   */
+  private migrateCreateSessionSearchIndex(): void {
+    try {
+      const existed = !!this.db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_messages_fts'",
+      ).get();
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
+          text, session_id UNINDEXED, role UNINDEXED, message_kind UNINDEXED,
+          tokenize = 'porter unicode61'
+        );
+        CREATE TABLE IF NOT EXISTS session_search_index_state (
+          key TEXT PRIMARY KEY,
+          value INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS session_messages_fts_hot_delete
+        AFTER DELETE ON session_messages BEGIN
+          DELETE FROM session_messages_fts
+          WHERE rowid = old.id
+            AND NOT EXISTS (SELECT 1 FROM session_message_archive WHERE original_message_id = old.id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_messages_fts_archive_delete
+        AFTER DELETE ON session_message_archive BEGIN
+          DELETE FROM session_messages_fts
+          WHERE rowid = old.original_message_id
+            AND NOT EXISTS (SELECT 1 FROM session_messages WHERE id = old.original_message_id);
+        END;
+      `);
+      if (!existed) {
+        const maxId = this.db.prepare(`
+          SELECT MAX(id) AS max_id FROM (
+            SELECT MAX(id) AS id FROM session_messages
+            UNION ALL
+            SELECT MAX(original_message_id) AS id FROM session_message_archive
+          )
+        `).get() as { max_id: number | null };
+        const upsert = this.db.prepare(
+          'INSERT OR REPLACE INTO session_search_index_state (key, value) VALUES (?, ?)',
+        );
+        upsert.run('backfill_upto', Number(maxId.max_id ?? 0));
+        upsert.run('backfill_cursor', 0);
+      }
+    } catch (error) {
+      if (error instanceof Error) {
+        console.warn(`[migration] migrateCreateSessionSearchIndex: ${error.message}`);
+      }
+    }
+  }
+
+  private static readonly UNSEARCHABLE_KINDS = new Set<string>([
+    'worker_internal', 'system_internal', 'assistant_internal',
+  ]);
+
+  /** Index one message for session_search. Never throws into the write path. */
+  private indexSessionMessageForSearch(
+    id: number,
+    sessionId: string,
+    role: string,
+    content: string,
+    messageKind: string,
+  ): boolean {
+    if (ScallopDatabase.UNSEARCHABLE_KINDS.has(messageKind)) return false;
+    try {
+      const text = searchableMessageText(content).trim();
+      if (!text) return false;
+      const exists = this.db.prepare('SELECT 1 FROM session_messages_fts WHERE rowid = ?').get(id);
+      if (exists) return false;
+      this.db.prepare(`
+        INSERT INTO session_messages_fts (rowid, text, session_id, role, message_kind)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(id, text, sessionId, role, messageKind);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Index up to `maxRows` pre-existing messages. Returns the number of rows
+   * scanned; 0 once the backfill is complete. Safe to call repeatedly.
+   */
+  backfillSessionSearchIndex(maxRows: number = 2_000): number {
+    let state: Map<string, number>;
+    try {
+      state = new Map((this.db.prepare('SELECT key, value FROM session_search_index_state').all() as Array<{ key: string; value: number }>)
+        .map(row => [row.key, Number(row.value)]));
+    } catch {
+      return 0;
+    }
+    const upto = state.get('backfill_upto') ?? 0;
+    const cursor = state.get('backfill_cursor') ?? 0;
+    if (cursor >= upto) return 0;
+    const limit = Math.max(1, maxRows);
+    const rows = this.db.prepare(`
+      SELECT id, session_id, role, content, message_kind FROM (
+        SELECT id, session_id, role, content, message_kind FROM session_messages
+        WHERE id > ? AND id <= ?
+        UNION ALL
+        SELECT original_message_id AS id, session_id, role, content, message_kind
+        FROM session_message_archive cold
+        WHERE original_message_id > ? AND original_message_id <= ?
+          AND NOT EXISTS (SELECT 1 FROM session_messages live WHERE live.id = cold.original_message_id)
+      )
+      ORDER BY id
+      LIMIT ?
+    `).all(cursor, upto, cursor, upto, limit) as Array<{
+      id: number; session_id: string; role: string; content: string; message_kind: string | null;
+    }>;
+    const run = this.db.transaction(() => {
+      for (const row of rows) {
+        const kind = isPersistedSessionMessageKind(row.message_kind)
+          ? row.message_kind
+          : inferSessionMessageKind(row.role, row.content, null);
+        this.indexSessionMessageForSearch(row.id, row.session_id, row.role, row.content, kind);
+      }
+      const next = rows.length < limit ? upto : rows[rows.length - 1].id;
+      this.db.prepare('INSERT OR REPLACE INTO session_search_index_state (key, value) VALUES (?, ?)')
+        .run('backfill_cursor', next);
+    });
+    run();
+    return rows.length;
+  }
+
+  /** SQL fragment + params restricting `s` (sessions) to the owners' user-facing sessions. */
+  private sessionOwnerFilter(userIds: readonly string[]): { sql: string; params: string[] } {
+    const ids = [...new Set(userIds.map(id => id.trim()).filter(Boolean))];
+    if (ids.length === 0) return { sql: '0', params: [] };
+    const meta = "(CASE WHEN json_valid(s.metadata) THEN s.metadata ELSE '{}' END)";
+    return {
+      sql: `json_extract(${meta}, '$.userId') IN (${ids.map(() => '?').join(', ')})
+        AND COALESCE(json_extract(${meta}, '$.isSubAgent'), 0) != 1
+        AND COALESCE(json_extract(${meta}, '$.internal'), 0) != 1
+        AND COALESCE(json_extract(${meta}, '$.background'), 0) != 1
+        AND COALESCE(json_extract(${meta}, '$.source'), '') NOT IN ('scheduler', 'worker', 'gardener')
+        AND COALESCE(json_extract(${meta}, '$.channelId'), '') NOT IN ('subagent', 'background')`,
+      params: ids,
+    };
+  }
+
+  /** BM25 full-text search over the owners' session messages (best first). */
+  searchSessionMessages(options: {
+    match: string;
+    userIds: readonly string[];
+    sessionId?: string;
+    limit?: number;
+  }): Array<{
+    messageId: number; sessionId: string; role: string; messageKind: string;
+    snippet: string; score: number; createdAt: number | null;
+  }> {
+    const owner = this.sessionOwnerFilter(options.userIds);
+    const params: unknown[] = [options.match, ...owner.params];
+    let sessionClause = '';
+    if (options.sessionId) {
+      sessionClause = 'AND f.session_id = ?';
+      params.push(options.sessionId);
+    }
+    params.push(Math.max(1, Math.min(200, options.limit ?? 20)));
+    const rows = this.db.prepare(`
+      SELECT f.rowid AS message_id, f.session_id, f.role, f.message_kind,
+        snippet(session_messages_fts, 0, '«', '»', '…', 24) AS snippet,
+        bm25(session_messages_fts) AS score,
+        COALESCE(live.created_at, cold.created_at) AS created_at
+      FROM session_messages_fts f
+      JOIN sessions s ON s.id = f.session_id
+      LEFT JOIN session_messages live ON live.id = f.rowid
+      LEFT JOIN session_message_archive cold ON cold.original_message_id = f.rowid
+      WHERE session_messages_fts MATCH ?
+        AND (live.id IS NOT NULL OR cold.original_message_id IS NOT NULL)
+        AND ${owner.sql}
+        ${sessionClause}
+      ORDER BY score ASC, f.rowid DESC
+      LIMIT ?
+    `).all(...params) as Array<Record<string, unknown>>;
+    return rows.map(row => ({
+      messageId: Number(row.message_id),
+      sessionId: String(row.session_id),
+      role: String(row.role),
+      messageKind: String(row.message_kind),
+      snippet: String(row.snippet ?? ''),
+      score: Number(row.score),
+      createdAt: row.created_at == null ? null : Number(row.created_at),
+    }));
+  }
+
+  /** True when the session belongs to one of the owners (user-facing sessions only). */
+  sessionBelongsToUsers(sessionId: string, userIds: readonly string[]): boolean {
+    const owner = this.sessionOwnerFilter(userIds);
+    return !!this.db.prepare(`SELECT 1 FROM sessions s WHERE s.id = ? AND ${owner.sql}`)
+      .get(sessionId, ...owner.params);
+  }
+
+  /**
+   * Messages of one session around an anchor id, from the hot table and the
+   * cold archive. `before`/`after` count messages strictly before/after the
+   * anchor; the anchor itself is included when `includeAnchor`.
+   */
+  getSessionMessagesAround(
+    sessionId: string,
+    anchorId: number,
+    before: number,
+    after: number,
+    includeAnchor: boolean = true,
+  ): SessionMessageRow[] {
+    const union = `
+      SELECT id, session_id, role, content, message_kind, created_at FROM session_messages WHERE session_id = ?
+      UNION ALL
+      SELECT original_message_id AS id, session_id, role, content, message_kind, created_at
+      FROM session_message_archive cold
+      WHERE session_id = ? AND NOT EXISTS (SELECT 1 FROM session_messages live WHERE live.id = cold.original_message_id)
+    `;
+    const older = before > 0
+      ? this.db.prepare(`SELECT * FROM (${union}) WHERE id < ? ORDER BY id DESC LIMIT ?`)
+        .all(sessionId, sessionId, anchorId, before) as Record<string, unknown>[]
+      : [];
+    const anchor = includeAnchor
+      ? this.db.prepare(`SELECT * FROM (${union}) WHERE id = ?`).all(sessionId, sessionId, anchorId) as Record<string, unknown>[]
+      : [];
+    const newer = after > 0
+      ? this.db.prepare(`SELECT * FROM (${union}) WHERE id > ? ORDER BY id ASC LIMIT ?`)
+        .all(sessionId, sessionId, anchorId, after) as Record<string, unknown>[]
+      : [];
+    return [...older.reverse(), ...anchor, ...newer].map(row => this.rowToSessionMessage(row));
+  }
+
+  /** Latest message id of a session (hot or archived), or null. */
+  getLatestSessionMessageId(sessionId: string): number | null {
+    const row = this.db.prepare(`
+      SELECT MAX(id) AS id FROM (
+        SELECT MAX(id) AS id FROM session_messages WHERE session_id = ?
+        UNION ALL
+        SELECT MAX(original_message_id) AS id FROM session_message_archive WHERE session_id = ?
+      )
+    `).get(sessionId, sessionId) as { id: number | null };
+    return row.id == null ? null : Number(row.id);
+  }
+
+  /** Recent user-facing sessions of the owners, newest first. */
+  listSessionsForUsers(userIds: readonly string[], limit: number = 10): Array<{
+    id: string; createdAt: number; updatedAt: number; archivedAt: number | null;
+    messageCount: number; firstUserMessage: string | null; channelId: string | null;
+  }> {
+    const owner = this.sessionOwnerFilter(userIds);
+    const rows = this.db.prepare(`
+      SELECT s.id, s.created_at, s.updated_at, s.archived_at, s.metadata,
+        (SELECT COUNT(*) FROM session_messages WHERE session_id = s.id)
+          + (SELECT COUNT(*) FROM session_message_archive cold WHERE cold.session_id = s.id
+             AND NOT EXISTS (SELECT 1 FROM session_messages live WHERE live.id = cold.original_message_id)) AS message_count,
+        COALESCE(
+          (SELECT content FROM session_messages WHERE session_id = s.id AND message_kind = 'human_user' ORDER BY id LIMIT 1),
+          (SELECT content FROM session_message_archive WHERE session_id = s.id AND message_kind = 'human_user' ORDER BY original_message_id LIMIT 1)
+        ) AS first_user
+      FROM sessions s
+      WHERE ${owner.sql}
+      ORDER BY s.updated_at DESC
+      LIMIT ?
+    `).all(...owner.params, Math.max(1, Math.min(100, limit))) as Array<Record<string, unknown>>;
+    return rows
+      .map(row => {
+        let channelId: string | null = null;
+        try {
+          const metadata = typeof row.metadata === 'string' ? JSON.parse(row.metadata) as Record<string, unknown> : null;
+          channelId = typeof metadata?.channelId === 'string' ? metadata.channelId : null;
+        } catch { /* malformed metadata: no channel */ }
+        return {
+          id: String(row.id),
+          createdAt: Number(row.created_at),
+          updatedAt: Number(row.updated_at),
+          archivedAt: row.archived_at == null ? null : Number(row.archived_at),
+          messageCount: Number(row.message_count ?? 0),
+          firstUserMessage: typeof row.first_user === 'string' ? row.first_user : null,
+          channelId,
+        };
+      })
+      .filter(row => row.messageCount > 0);
+  }
+
+  getSessionCompaction(sessionId: string): {
+    stateJson: string; summaryMessage: string; compactionCount: number; createdAt: number; updatedAt: number;
+  } | null {
+    const row = this.db.prepare('SELECT * FROM session_compactions WHERE session_id = ?')
+      .get(sessionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      stateJson: String(row.state_json),
+      summaryMessage: String(row.summary_message),
+      compactionCount: Number(row.compaction_count ?? 0),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  /** Upsert: the compaction summary is updated in place across compactions. */
+  saveSessionCompaction(sessionId: string, stateJson: string, summaryMessage: string, compactionCount: number): void {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO session_compactions (session_id, state_json, summary_message, compaction_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        state_json = excluded.state_json,
+        summary_message = excluded.summary_message,
+        compaction_count = excluded.compaction_count,
+        updated_at = excluded.updated_at
+    `).run(sessionId, stateJson, summaryMessage, compactionCount, now, now);
+  }
+
+  deleteSessionCompaction(sessionId: string): boolean {
+    return this.db.prepare('DELETE FROM session_compactions WHERE session_id = ?').run(sessionId).changes > 0;
   }
 
   getSessionMessagesPaginated(sessionId: string, limit: number, before?: number): { messages: SessionMessageRow[]; hasMore: boolean } {
@@ -6390,12 +6920,13 @@ export class ScallopDatabase {
 
   recordCostUsage(record: Omit<CostUsageRow, 'id'>): CostUsageRow {
     const stmt = this.db.prepare(`
-      INSERT INTO cost_usage (model, provider, session_id, input_tokens, output_tokens, cost, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO cost_usage (model, provider, session_id, input_tokens, output_tokens, cost, timestamp, purpose)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const result = stmt.run(
       record.model, record.provider, record.sessionId,
-      record.inputTokens, record.outputTokens, record.cost, record.timestamp
+      record.inputTokens, record.outputTokens, record.cost, record.timestamp,
+      record.purpose ?? null,
     );
     return { ...record, id: Number(result.lastInsertRowid) };
   }
@@ -8348,6 +8879,31 @@ export class ScallopDatabase {
     return rows.map(r => ({ id: r.id, target: r.target, kind: r.kind, at: r.at, baselineFitness: r.baseline_fitness }));
   }
 
+  /** One ledger row by id, any status (rollback-by-id). */
+  getEvolutionVersionById(id: number): {
+    id: number; target: string; kind: string; at: number; status: string;
+    baselineFitness: number | null; snapshot: string | null; detail: Record<string, unknown> | null;
+  } | null {
+    const row = this.db.prepare(`
+      SELECT id, target, kind, at, status, baseline_fitness, snapshot, detail
+      FROM evolution_versions WHERE id = ?
+    `).get(id) as {
+      id: number; target: string; kind: string; at: number; status: string;
+      baseline_fitness: number | null; snapshot: string | null; detail: string | null;
+    } | undefined;
+    if (!row) return null;
+    let detail: Record<string, unknown> | null = null;
+    try {
+      detail = row.detail ? JSON.parse(row.detail) as Record<string, unknown> : null;
+    } catch {
+      detail = null;
+    }
+    return {
+      id: row.id, target: row.target, kind: row.kind, at: row.at, status: row.status,
+      baselineFitness: row.baseline_fitness, snapshot: row.snapshot, detail,
+    };
+  }
+
   /** Mark a version row as rolled back. */
   markEvolutionVersionRolledBack(id: number): void {
     this.db.prepare(`UPDATE evolution_versions SET status = 'rolled_back' WHERE id = ?`).run(id);
@@ -8764,6 +9320,133 @@ export class ScallopDatabase {
     return row.count;
   }
 
+  // ============ Heartbeats ============
+
+  /** Agent-created recurring wake-ups (see src/proactive/heartbeats.ts). */
+  private migrateCreateHeartbeats(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS heartbeats (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        user_id TEXT,
+        instruction TEXT NOT NULL,
+        interval_minutes INTEGER NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'follow_up',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        next_fire_at INTEGER NOT NULL,
+        last_fired_at INTEGER,
+        fire_count INTEGER NOT NULL DEFAULT 0,
+        last_outcome TEXT,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_heartbeats_due ON heartbeats(enabled, next_fire_at);
+      CREATE INDEX IF NOT EXISTS idx_heartbeats_user ON heartbeats(user_id);
+    `);
+  }
+
+  private rowToHeartbeat(row: Record<string, unknown>): HeartbeatRow {
+    return {
+      id: row.id as string,
+      sessionId: row.session_id as string,
+      userId: (row.user_id as string | null) ?? null,
+      instruction: row.instruction as string,
+      intervalMinutes: row.interval_minutes as number,
+      mode: row.mode === 'steer' ? 'steer' : 'follow_up',
+      enabled: row.enabled === 1,
+      nextFireAt: row.next_fire_at as number,
+      lastFiredAt: (row.last_fired_at as number | null) ?? null,
+      fireCount: row.fire_count as number,
+      lastOutcome: (row.last_outcome as string | null) ?? null,
+      lastError: (row.last_error as string | null) ?? null,
+      createdAt: row.created_at as number,
+      updatedAt: row.updated_at as number,
+    };
+  }
+
+  createHeartbeat(input: {
+    id: string;
+    sessionId: string;
+    userId: string | null;
+    instruction: string;
+    intervalMinutes: number;
+    mode: 'steer' | 'follow_up';
+    nextFireAt: number;
+  }): HeartbeatRow {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO heartbeats (id, session_id, user_id, instruction, interval_minutes, mode, enabled, next_fire_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    `).run(input.id, input.sessionId, input.userId, input.instruction, input.intervalMinutes, input.mode, input.nextFireAt, now, now);
+    return this.getHeartbeat(input.id)!;
+  }
+
+  getHeartbeat(id: string): HeartbeatRow | null {
+    const row = this.db.prepare('SELECT * FROM heartbeats WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? this.rowToHeartbeat(row) : null;
+  }
+
+  /** Enabled heartbeats owned by any of the given user ids (or on the given session). */
+  listHeartbeats(filter: { userIds?: string[]; sessionId?: string; includeDisabled?: boolean } = {}): HeartbeatRow[] {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    const owner: string[] = [];
+    if (filter.userIds && filter.userIds.length > 0) {
+      owner.push(`user_id IN (${filter.userIds.map(() => '?').join(', ')})`);
+      params.push(...filter.userIds);
+    }
+    if (filter.sessionId) {
+      owner.push('session_id = ?');
+      params.push(filter.sessionId);
+    }
+    if (owner.length > 0) clauses.push(`(${owner.join(' OR ')})`);
+    if (!filter.includeDisabled) clauses.push('enabled = 1');
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`SELECT * FROM heartbeats ${where} ORDER BY created_at`).all(...params) as Record<string, unknown>[];
+    return rows.map(row => this.rowToHeartbeat(row));
+  }
+
+  deleteHeartbeat(id: string): boolean {
+    return this.db.prepare('DELETE FROM heartbeats WHERE id = ?').run(id).changes > 0;
+  }
+
+  /**
+   * Claim due heartbeats: each claimed row's next_fire_at is advanced by its
+   * interval in the same transaction, so a crash mid-fire skips one beat
+   * instead of firing twice.
+   */
+  claimDueHeartbeats(now: number = Date.now(), limit = 20): HeartbeatRow[] {
+    const claim = this.db.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT * FROM heartbeats WHERE enabled = 1 AND next_fire_at <= ? ORDER BY next_fire_at LIMIT ?
+      `).all(now, limit) as Record<string, unknown>[];
+      const advance = this.db.prepare(`
+        UPDATE heartbeats SET next_fire_at = ?, last_fired_at = ?, fire_count = fire_count + 1, updated_at = ?
+        WHERE id = ? AND next_fire_at = ?
+      `);
+      const claimed: HeartbeatRow[] = [];
+      for (const row of rows) {
+        const hb = this.rowToHeartbeat(row);
+        const next = now + hb.intervalMinutes * 60_000;
+        if (advance.run(next, now, now, hb.id, hb.nextFireAt).changes > 0) {
+          claimed.push({ ...hb, nextFireAt: next, lastFiredAt: now, fireCount: hb.fireCount + 1 });
+        }
+      }
+      return claimed;
+    });
+    return claim();
+  }
+
+  recordHeartbeatOutcome(id: string, update: { outcome: string; error?: string | null; sessionId?: string; disable?: boolean }): void {
+    this.db.prepare(`
+      UPDATE heartbeats
+      SET last_outcome = ?, last_error = ?, session_id = COALESCE(?, session_id),
+          enabled = CASE WHEN ? THEN 0 ELSE enabled END, updated_at = ?
+      WHERE id = ?
+    `).run(update.outcome, update.error ?? null, update.sessionId ?? null, update.disable ? 1 : 0, Date.now(), id);
+  }
+
   /**
    * Run a raw SQL query (for advanced use cases)
    */
@@ -8959,6 +9642,7 @@ export class ScallopDatabase {
       outputTokens: row.output_tokens as number,
       cost: row.cost as number,
       timestamp: row.timestamp as number,
+      purpose: (row.purpose as string | null | undefined) ?? null,
     };
   }
 

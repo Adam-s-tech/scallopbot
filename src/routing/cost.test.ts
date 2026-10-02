@@ -619,6 +619,41 @@ describe('CostTracker', () => {
       expect(response.usage.inputTokens).toBe(500);
     });
 
+    it('records usage on streamed calls and passes deltas through', async () => {
+      const mock: LLMProvider = {
+        ...createMockProvider('openrouter', 'qwen/qwen3.6-plus'),
+        completeStream: vi.fn().mockImplementation(async (_req, handlers) => {
+          handlers.onTextDelta?.('stre');
+          handlers.onTextDelta?.('amed');
+          return {
+            content: [{ type: 'text', text: 'streamed' }],
+            stopReason: 'end_turn',
+            usage: { inputTokens: 1000, outputTokens: 50, cachedInputTokens: 800 },
+            model: 'qwen/qwen3.6-plus',
+          } as CompletionResponse;
+        }),
+      };
+      const wrapped = tracker.wrapProvider(mock, 'stream-session');
+      const deltas: string[] = [];
+
+      const response = await wrapped.completeStream!(
+        { messages: [{ role: 'user', content: 'hello' }] },
+        { onTextDelta: (t) => deltas.push(t) },
+      );
+
+      expect(deltas).toEqual(['stre', 'amed']);
+      expect(response.content).toEqual([{ type: 'text', text: 'streamed' }]);
+      const history = tracker.getUsageHistory();
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({ sessionId: 'stream-session', inputTokens: 1000, outputTokens: 50, provider: 'openrouter' });
+      expect(mock.complete).not.toHaveBeenCalled();
+    });
+
+    it('does not invent completeStream for providers without it', () => {
+      const wrapped = tracker.wrapProvider(createMockProvider('xai', 'grok-4'), 's');
+      expect(wrapped.completeStream).toBeUndefined();
+    });
+
     it('should preserve provider name and isAvailable', () => {
       const mock = createMockProvider('xai', 'grok-4');
       const wrapped = tracker.wrapProvider(mock, 'test-session');
@@ -658,6 +693,72 @@ describe('CostTracker', () => {
 
       const history = tracker.getUsageHistory();
       expect(history[0].sessionId).toBe('unknown');
+    });
+  });
+
+  describe('purpose column', () => {
+    function purposeProvider(): LLMProvider {
+      return {
+        name: 'moonshot',
+        model: 'kimi-k2.5',
+        isAvailable: () => true,
+        complete: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'ok' }],
+          stopReason: 'end_turn',
+          usage: { inputTokens: 100, outputTokens: 10 },
+          model: 'kimi-k2.5',
+        } as CompletionResponse),
+      };
+    }
+
+    it('records request.purpose in history and cost_usage when wrapping a provider', async () => {
+      const db = new ScallopDatabase(':memory:');
+      try {
+        const t = new CostTracker({ db });
+        const wrapped = t.wrapProvider(purposeProvider(), 's1');
+        await wrapped.complete({ messages: [{ role: 'user', content: 'hi' }], purpose: 'outcome_brain' });
+        await wrapped.complete({ messages: [{ role: 'user', content: 'hi' }] });
+
+        expect(t.getUsageHistory().map(r => r.purpose)).toEqual(['outcome_brain', undefined]);
+        expect(db.getCostUsageBySession('s1').map(r => r.purpose)).toEqual(['outcome_brain', null]);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('adds the nullable column to a legacy cost_usage table without losing rows', async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { default: Database } = await import('better-sqlite3');
+      const dir = mkdtempSync(join(tmpdir(), 'cost-purpose-'));
+      const dbPath = join(dir, 'legacy.db');
+      try {
+        const legacy = new Database(dbPath);
+        legacy.exec(`CREATE TABLE cost_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, provider TEXT NOT NULL,
+          session_id TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+          cost REAL NOT NULL, timestamp INTEGER NOT NULL)`);
+        legacy.prepare('INSERT INTO cost_usage (model, provider, session_id, input_tokens, output_tokens, cost, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run('old-model', 'openai', 'legacy', 1, 1, 0.01, Date.now());
+        legacy.close();
+
+        const db = new ScallopDatabase(dbPath);
+        try {
+          expect(db.getCostUsageBySession('legacy')).toEqual([
+            expect.objectContaining({ model: 'old-model', purpose: null }),
+          ]);
+          db.recordCostUsage({
+            model: 'm', provider: 'p', sessionId: 'legacy', inputTokens: 1, outputTokens: 1,
+            cost: 0, timestamp: Date.now(), purpose: 'tool_call',
+          });
+          expect(db.getCostUsageBySession('legacy').map(r => r.purpose)).toEqual([null, 'tool_call']);
+        } finally {
+          db.close();
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 
@@ -753,5 +854,17 @@ describe('CostTracker', () => {
         db.close();
       }
     });
+  });
+});
+
+describe('current model pricing and cached input', () => {
+  it('prices current Kimi/GPT models and bills cached input at the cache-read rate', () => {
+    const tracker = new CostTracker({});
+    expect(tracker.calculateCost('kimi-k3', { inputTokens: 1_000_000, outputTokens: 0 })).toBeCloseTo(3);
+    // 800k of 1M input tokens came from cache: 0.2M × $3 + 0.8M × $0.30.
+    expect(tracker.calculateCost('kimi-k3', { inputTokens: 1_000_000, outputTokens: 0, cachedInputTokens: 800_000 }))
+      .toBeCloseTo(0.6 + 0.24);
+    expect(tracker.calculateCost('kimi-k2.6', { inputTokens: 0, outputTokens: 1_000_000 })).toBeCloseTo(4);
+    expect(tracker.calculateCost('gpt-5.6-luna', { inputTokens: 1_000_000, outputTokens: 1_000_000 })).toBeCloseTo(1.4);
   });
 });

@@ -15,14 +15,16 @@ import {
   type LLMProvider,
 } from '../providers/index.js';
 import { defineSkill } from '../skills/sdk.js';
+import { registerSessionSearchTool } from '../context/session-search.js';
 import { SessionManager } from '../agent/session.js';
-import { Agent } from '../agent/agent.js';
+import { Agent, type AgentHooks } from '../agent/agent.js';
 import { initSecurityLayers } from '../security/startup.js';
 import { vaultLoadResult } from '../config/config.js';
 import { EvolutionRecorder } from '../evolution/signals.js';
 import { EvolutionEngine } from '../evolution/engine.js';
 import { createLoadProcedureSkill } from '../evolution/procedure-skill.js';
 import { SkillStore } from '../evolution/skill-store.js';
+import { LearningRuntime } from '../learning/index.js';
 import { TelegramChannel } from '../channels/telegram.js';
 import { TelegramGateway } from '../channels/telegram-gateway.js';
 import { ApiChannel } from '../channels/api.js';
@@ -57,6 +59,9 @@ import { BotConfigManager } from '../channels/bot-config.js';
 import { GoalService, createVerifiedGoalSkill } from '../goals/index.js';
 import { BoardService } from '../board/board-service.js';
 import { SubAgentRegistry, SubAgentExecutor, AnnounceQueue } from '../subagent/index.js';
+import { createSubAgentSkills } from '../subagent/tools.js';
+import { formatAgentExited, formatAgentResult } from '../subagent/messages.js';
+import { SessionWaker, setSessionWaker, type WakeOptions, type WakeOutcome, type WakeTurnRequest } from './wake.js';
 import { InterruptQueue } from '../agent/interrupt-queue.js';
 import { setTraceSink } from '../routing/trace-tap.js';
 import { setHookLogger } from '../hooks/hooks.js';
@@ -64,9 +69,29 @@ import { registerWebhookEventRelay } from '../hooks/webhook-relay.js';
 import { SafeWorkflowExecutor, createExecuteWorkflowSkill } from '../workflow/index.js';
 import { matchesPolicy } from '../skills/tool-policy.js';
 import { resolveStateUserId, resolveStateUserTimezone } from '../utils/state-user-id.js';
+import { stripThinkTags } from '../utils/output-safety.js';
 import { inspectArtifact, validateArtifactForDelivery } from '../artifacts/delivery.js';
 import { OutcomeBrain } from '../brain/index.js';
 import { registerMediaSkills, type MediaSkills } from '../skills/media-skills.js';
+import { backgroundProcesses, createBashDoneRouter, type BackgroundExitEvent } from '../tools/shell/index.js';
+import { registerAgentTools, coreToolHooks } from '../tools/index.js';
+import { getTodoSnapshot } from '../tools/todo/index.js';
+import {
+  codeModeConfigFromEnv,
+  resolveAgentMode,
+  registerCodeModeTool,
+  registerExecuteCodeTool,
+  buildCodeModePrompt,
+  listKernelVariables,
+  CODE_MODE_COMPACTION_NOTE,
+  CODE_TOOL_NAME,
+  EXECUTE_CODE_TOOL_NAME,
+  type BackgroundEvent,
+} from '../codemode/index.js';
+import { buildRecallBlock, buildRecallDigest } from '../memory/recall.js';
+import { enqueueInLane, laneIsBusy } from '../agent/command-queue.js';
+import type { FileTools } from '../tools/files/index.js';
+import { setupAlwaysOn, shutdownAlwaysOn, type AlwaysOn } from './always-on.js';
 
 export interface GatewayOptions {
   config: Config;
@@ -84,6 +109,8 @@ export class Gateway {
   private router: Router | null = null;
   private purposeRouter: PurposeRouter | null = null;
   private evolutionEngine: EvolutionEngine | null = null;
+  /** Core memory, skill authoring, curator, background review + refine (Phase 5). */
+  private learning: LearningRuntime | null = null;
   private costTracker: CostTracker | null = null;
   private scallopMemoryStore: ScallopMemoryStore | null = null;
   private backgroundGardener: BackgroundGardener | null = null;
@@ -104,12 +131,17 @@ export class Gateway {
   private subAgentExecutor: SubAgentExecutor | null = null;
   private announceQueue: AnnounceQueue | null = null;
   private interruptQueue: InterruptQueue | null = null;
+  private alwaysOn: AlwaysOn | null = null;
   private outboundQueue: OutboundQueue | null = null;
   private outcomeBrain: OutcomeBrain | null = null;
   private mediaSkills: MediaSkills | null = null;
+  /** Native file tools (read_file/write_file/patch/edit_file/undo); per-session state lives here. */
+  private fileTools: FileTools | null = null;
   private subAgentDeliveryTimer: NodeJS.Timeout | null = null;
+  private sessionWaker: SessionWaker | null = null;
   /** Opt-in email inbox trigger + calendar heads-up (src/triggers/mail-calendar.ts). */
   private mailCalendarTriggers: { stop(): void } | null = null;
+  private bashDoneListener: ((e: BackgroundExitEvent) => void) | null = null;
   /** Explicit aliases for this deployment's single canonical state owner. */
   private canonicalSingleUserIds: string[] = [];
 
@@ -231,6 +263,9 @@ export class Gateway {
       embedder,
       embeddingModel: embeddingSetup.key,
       rerankProvider,
+      // Foreground recall is BM25 + embeddings (+graph) only unless
+      // MEMORY_FOREGROUND_RERANK=true; no LLM call sits before the reply.
+      foregroundRerank: this.config.memory.foregroundRerank,
       relationsProvider: rerankProvider,
       mmrEnabled: this.config.memory.mmrEnabled,
       mmrLambda: this.config.memory.mmrLambda,
@@ -371,7 +406,10 @@ export class Gateway {
       },
       onSleepTick: async () => {
         await this.evolutionEngine?.runOptimizer();
-        await this.evolutionEngine?.runCurator();
+        // Archive agent-created skills unused for 30 days (pinned/bundled exempt).
+        // Runs even when the evolution optimizer is disabled.
+        if (this.evolutionEngine) await this.evolutionEngine.runCurator();
+        else await this.learning?.curator.runNightly();
       },
     });
 
@@ -416,7 +454,7 @@ export class Gateway {
         maxOutputBytes: this.config.tuning?.skills?.maxOutputBytes,
         canonicalSingleUserIds: this.canonicalSingleUserIds,
         onSkillExecuted: async (name: string, success: boolean) => {
-          if (success) await this.evolutionEngine?.recordSkillUse(name);
+          if (success) await this.learning?.curator.recordSkillUse(name);
         },
       }
     );
@@ -424,6 +462,8 @@ export class Gateway {
 
     // Self-evolution engine (Layer 2). Constructed now that the skill registry +
     // executor exist; the gardener's deep/sleep ticks drive it (late-bound above).
+    // One SkillStore (one .usage.json write queue) shared by evolution + learning.
+    const sharedSkillStore = new SkillStore({ logger: this.logger });
     if (this.config.evolution?.enabled) {
       const evoDb = this.scallopMemoryStore.getDatabase();
       const registry = this.skillRegistry;
@@ -443,9 +483,37 @@ export class Gateway {
             : { exists: false };
         },
         config: this.config.evolution,
+        store: sharedSkillStore,
         logger: this.logger,
       });
       this.logger.debug('Self-evolution engine initialized');
+    }
+
+    {
+      const purposeRouter = this.purposeRouter;
+      const evolutionConfig = this.config.evolution;
+      this.learning = new LearningRuntime({
+        db: this.scallopMemoryStore.getDatabase(),
+        scallopStore: this.scallopMemoryStore,
+        registry: this.skillRegistry,
+        workspace: this.config.agent.workspace,
+        canonicalSingleUserIds: this.canonicalSingleUserIds,
+        skillStore: sharedSkillStore,
+        getReviewProvider: () => purposeRouter.providerFor('evolution'),
+        getCheapProvider: () => purposeRouter.providerFor('cognition'),
+        getJudgeProvider: evolutionConfig?.useLlmJudge === false
+          ? undefined
+          : () => purposeRouter.providerFor('evolution'),
+        curator: evolutionConfig
+          ? {
+              enabled: evolutionConfig.curatorEnabled,
+              staleAfterDays: evolutionConfig.curatorStaleDays,
+              archiveAfterDays: evolutionConfig.curatorArchiveDays,
+              backupKeep: evolutionConfig.curatorBackupKeep,
+            }
+          : undefined,
+        logger: this.logger,
+      });
     }
 
     // Initialize voice manager (for voice reply tool)
@@ -458,6 +526,7 @@ export class Gateway {
 
     // Register native skills (comms + memory_get) that need runtime access
     this.registerNativeSkills(voiceStatus.tts);
+    // Native coding/web tools: bash + process, todo, webfetch + web_search
     // image_gen / phone_call / sms: bundled SKILL.md, in-process handlers
     const mediaVoice = voiceStatus.tts ? this.voiceManager : null;
     this.mediaSkills = registerMediaSkills({
@@ -471,7 +540,7 @@ export class Gateway {
       synthesize: mediaVoice ? (text) => mediaVoice.synthesize(text, { format: 'mp3' }) : undefined,
     });
     this.logger.debug(
-      { nativeSkills: ['send_message', 'send_file', 'inspect_artifact', 'voice_reply', 'memory_get', 'load_procedure'].filter(n => this.skillRegistry!.hasSkill(n)) },
+      { nativeSkills: ['send_message', 'send_file', 'inspect_artifact', 'voice_reply', 'memory_get', 'load_procedure', 'memory', 'skill_manage'].filter(n => this.skillRegistry!.hasSkill(n)) },
       'Native skills registered'
     );
 
@@ -553,6 +622,11 @@ export class Gateway {
             payloadJson: JSON.stringify({
               runId: row.id,
               label: row.label,
+              kind: 'agent-exited',
+              message: formatAgentExited(row.label, '', {
+                reason: 'process restarted while the agent was running; check for partial side effects before retrying',
+                runId: row.id,
+              }),
               result: {
                 status: 'blocked',
                 summary: 'The worker was interrupted by a process restart, so no success was assumed.',
@@ -588,6 +662,9 @@ export class Gateway {
       config: subagentConfig,
       canonicalSingleUserIds: this.canonicalSingleUserIds,
       deliveryOutbox: this.scallopMemoryStore!.getDatabase(),
+      // The outbox row is written before this fires; drain it right away
+      // instead of waiting for the 1s tick so idle parents wake promptly.
+      onResultReady: () => { if (this.isRunning) void this.drainSubAgentDeliveriesSafely(); },
       evolutionRecorder,
       outcomeBrain: this.outcomeBrain,
       skillPolicyResolver: async (skillName, context) => {
@@ -614,24 +691,9 @@ export class Gateway {
         const channelPolicy = channelId ? this.config.tools?.channelPolicies?.[channelId] : undefined;
         return !channelPolicy || matchesPolicy(toolName, channelPolicy);
       },
-      authorizeStep: async (toolUse, skill, context) => {
-        if (!this.outcomeBrain) return false;
-        const userId = context.userId ?? 'default';
-        const decision = await this.outcomeBrain.decideAction({
-          source: 'workflow',
-          userId,
-          sessionId: context.sessionId,
-          toolUse,
-          skill,
-          turn: {
-            userMessage: context.userMessage ?? 'Run the requested workflow.',
-            previousAssistantMessage: context.previousAssistantMessage,
-            timezone: this.getUserTimezone(userId),
-            now: new Date(context.turnStartedAt ?? Date.now()),
-          },
-        });
-        return decision.assessment.allowed;
-      },
+      // Workflow steps run like any other tool call: the user's request is
+      // the authorization, and tool policy above is the only filter.
+      authorizeStep: async () => true,
     });
     this.skillRegistry!.registerSkill(createExecuteWorkflowSkill(workflowExecutor));
     if (this.goalService) {
@@ -681,8 +743,38 @@ export class Gateway {
       announceQueue: this.announceQueue,
       subAgentExecutor: this.subAgentExecutor,
       interruptQueue: this.interruptQueue,
+      hooks: this.buildAgentHooks(),
+    });
+    // Background learning replays the exact last request so the cache hits.
+    const agentForReplay = this.agent;
+    this.learning?.setReplaySource((sessionId) => {
+      const last = agentForReplay.getLastRequest(sessionId);
+      return last?.system ? LearningRuntime.replay(last.system, last.messages, last.tools) : null;
     });
     this.logger.debug('Agent initialized');
+
+    // Idle wake-up for background completions (sub-agents, background bash).
+    this.sessionWaker = new SessionWaker({
+      isBusy: sessionId => laneIsBusy(`session:${sessionId}`),
+      runTurn: request => this.runWakeTurn(request),
+      logger: this.logger,
+    });
+    setSessionWaker(this.sessionWaker);
+
+    // Goal mode, agent-created heartbeats and the wake runtime they share.
+    this.alwaysOn = setupAlwaysOn(this.skillRegistry!, {
+      agent: this.agent,
+      sessionManager: this.sessionManager,
+      db: this.scallopMemoryStore!.getDatabase(),
+      interruptQueue: this.interruptQueue,
+      costTracker: this.costTracker,
+      boardService: this.boardService,
+      deliver: (userId, text) => this.handleMessageSend(userId, text),
+      goalMaxTurns: this.config.agent.goalMaxTurns,
+      logger: this.logger,
+    });
+
+    this.setupCodeMode();
 
     // Initialize outbound queue (rate-limits proactive messages across all subsystems)
     this.outboundQueue = new OutboundQueue({
@@ -707,9 +799,12 @@ export class Gateway {
           : this.outboundQueue.createHandler(),
         getTimezone: (userId: string) => this.getUserTimezone(userId),
         canonicalSingleUserIds: this.canonicalSingleUserIds,
+        heartbeats: this.alwaysOn?.heartbeats,
       });
       this.logger.debug('Unified scheduler initialized');
     }
+
+    this.wireBashDoneNotices();
 
     this.isInitialized = true;
     this.logger.info('Gateway initialized successfully');
@@ -886,6 +981,7 @@ export class Gateway {
         voiceManager: this.voiceManager || undefined, // Share voice manager
         providerRegistry: this.providerRegistry || undefined,
         interruptQueue: this.interruptQueue || undefined,
+        goalMode: this.alwaysOn?.goalMode,
         onUserMessage: (prefixedUserId: string, userMessage?: string, context?) => {
           return this.unifiedScheduler?.checkEngagement(prefixedUserId, userMessage, context);
         },
@@ -934,6 +1030,7 @@ export class Gateway {
         memoryStore: this.scallopMemoryStore || undefined,
         db: this.scallopMemoryStore?.getDatabase(),
         interruptQueue: this.interruptQueue || undefined,
+        goalMode: this.alwaysOn?.goalMode,
         onUserMessage: (prefixedUserId: string, userMessage?: string) => {
           this.unifiedScheduler?.checkEngagement(prefixedUserId, userMessage);
         },
@@ -1051,6 +1148,7 @@ export class Gateway {
     if (this.unifiedScheduler) {
       this.unifiedScheduler.stop();
     }
+    shutdownAlwaysOn();
 
     // Stop outbound queue
     if (this.outboundQueue) {
@@ -1062,9 +1160,21 @@ export class Gateway {
       clearInterval(this.subAgentDeliveryTimer);
       this.subAgentDeliveryTimer = null;
     }
+    if (this.sessionWaker) {
+      this.sessionWaker.stop();
+      setSessionWaker(null);
+      this.sessionWaker = null;
+    }
 
     this.mailCalendarTriggers?.stop();
     this.mailCalendarTriggers = null;
+
+    // Background bash processes die with the gateway.
+    if (this.bashDoneListener) {
+      backgroundProcesses.off('exit', this.bashDoneListener);
+      this.bashDoneListener = null;
+    }
+    await backgroundProcesses.killAll();
 
     // Clear trigger sources before stopping channels
     this.triggerSources.clear();
@@ -1128,6 +1238,11 @@ export class Gateway {
     return this.agent;
   }
 
+  /** Phase 5 learning runtime (core memory, recall helpers, review, refine, curator). */
+  getLearningRuntime(): LearningRuntime | null {
+    return this.learning;
+  }
+
   getSkillRegistry(): SkillRegistry {
     if (!this.skillRegistry) {
       throw new Error('Gateway not initialized');
@@ -1142,8 +1257,126 @@ export class Gateway {
     return this.mediaProcessor;
   }
 
+  /** Native file tools; e.g. `getFileTools()?.store.resetReads(sessionId)` after compaction. */
+  getFileTools(): FileTools | null {
+    return this.fileTools;
+  }
+
   isGatewayRunning(): boolean {
     return this.isRunning;
+  }
+
+  /**
+   * Integrations the agent loop calls: large-output persistence on every tool
+   * result and the verify-on-stop nudge. Later phases add to this.
+   */
+  private buildAgentHooks(): AgentHooks {
+    const hooks: AgentHooks = {
+      ...coreToolHooks({
+        workspace: this.config.agent.workspace,
+        contextWindowTokens: this.config.context.maxContextTokens,
+      }),
+    };
+    const learning = this.learning;
+    const store = this.scallopMemoryStore;
+    // Compaction: carry the todo list through the summary, and forget which
+    // file ranges were read (the model no longer has that content).
+    hooks.compactionExtraState = (sessionId) => getTodoSnapshot(sessionId);
+    hooks.onCompaction = (sessionId) => {
+      this.fileTools?.store.resetReads(sessionId);
+    };
+    if (learning) {
+      hooks.skillIndex = () => learning.renderSkillIndex();
+      hooks.frozenPromptSections = ({ userId }) => [
+        learning.renderSessionCoreMemory(userId),
+        learning.renderPromptNotes(),
+      ];
+      // Running per-session totals for the review/refine triggers.
+      const totals = new Map<string, { turns: number; toolCalls: number }>();
+      hooks.afterTurn = ({ sessionId, userId, userMessage, toolCallCount, compacted }) => {
+        const total = totals.get(sessionId) ?? { turns: 0, toolCalls: 0 };
+        total.turns++;
+        total.toolCalls += toolCallCount;
+        totals.set(sessionId, total);
+        if (totals.size > 1_000) totals.delete(totals.keys().next().value!);
+        learning.reviewer.maybeScheduleReview({
+          sessionId,
+          userId,
+          turnCount: total.turns,
+          toolCallCount: total.toolCalls,
+          compacted,
+          userCorrection: userMessage,
+        });
+        learning.refine.maybeScheduleRefine({ sessionId, userId, turnCount: total.turns, compacted });
+      };
+    }
+    if (store) {
+      // Fast recall: BM25 + embeddings with a hard latency budget, no LLM.
+      // A session's first turn also gets the ranked digest.
+      hooks.recall = async ({ userId, userMessage, timezone, coldStart }) => {
+        const block = await buildRecallBlock(store, userId, userMessage, { budgetMs: 1_500, timezone });
+        if (!coldStart) return block;
+        const digest = buildRecallDigest(store, userId, { goal: userMessage, recentMessages: [userMessage] });
+        return [digest, block].filter((part) => part.trim()).join('\n\n');
+      };
+    }
+    return hooks;
+  }
+
+  /**
+   * Code mode (AGENT_MODE=code|hybrid, default tool): a persistent JS kernel
+   * per session with the tools as async functions. Registered after every
+   * other tool so its API listing is complete. Per turn, `selectTools` offers
+   * only `exec` (code), normal tools + `execute_code` (hybrid), or neither.
+   */
+  private setupCodeMode(): void {
+    const registry = this.skillRegistry;
+    if (!registry || !this.agent) return;
+    const config = codeModeConfigFromEnv();
+    if (config.mode === 'tool') return;
+
+    const workspace = this.config.agent.workspace;
+    const onBashDone = (event: BackgroundEvent): void => {
+      this.onIdleWake(event.sessionId, event.text, { kind: 'bash-done' });
+    };
+    const exec = registerCodeModeTool(registry, {
+      workspace,
+      skillExecutor: this.skillExecutor,
+      logger: this.logger,
+      toolName: config.mode === 'code' ? CODE_TOOL_NAME : EXECUTE_CODE_TOOL_NAME,
+      onBashDone,
+    });
+    if (config.mode === 'code' && config.fallback === 'hybrid') {
+      registerExecuteCodeTool(registry, { workspace, skillExecutor: this.skillExecutor, logger: this.logger, manager: exec.manager, setAsDefault: false });
+    }
+
+    let codePrompt: string | null = null;
+    const compactedSessions = new Set<string>();
+    this.agent.setHooks({
+      selectTools: (tools, modelId) => {
+        const mode = resolveAgentMode(modelId, config);
+        if (mode === 'code') return tools.filter((tool) => tool.name === CODE_TOOL_NAME);
+        if (mode === 'hybrid') return tools.filter((tool) => tool.name !== CODE_TOOL_NAME);
+        return tools.filter((tool) => tool.name !== CODE_TOOL_NAME && tool.name !== EXECUTE_CODE_TOOL_NAME);
+      },
+      frozenPromptSections: async (input) => {
+        const base = await this.buildAgentHooks().frozenPromptSections?.(input) ?? [];
+        if (resolveAgentMode(input.modelId, config) !== 'code') return base;
+        codePrompt ??= buildCodeModePrompt(registry);
+        return [...base, codePrompt];
+      },
+      compactionExtraState: (sessionId) => {
+        compactedSessions.add(sessionId);
+        return [getTodoSnapshot(sessionId), CODE_MODE_COMPACTION_NOTE].filter(Boolean).join('\n\n');
+      },
+      // After a compaction, tell the model which kernel variables still exist.
+      turnContextSections: async ({ sessionId }) => {
+        if (!compactedSessions.delete(sessionId)) return [];
+        const vars = await listKernelVariables(sessionId);
+        return vars.trim() ? [vars] : [];
+      },
+    });
+    this.logger.info({ mode: config.mode, fallback: config.fallback, denylist: config.denylist }, 'Code mode enabled');
   }
 
   /**
@@ -1152,6 +1385,10 @@ export class Gateway {
    */
   private registerNativeSkills(ttsAvailable: boolean): void {
     if (!this.skillRegistry) return;
+
+    // Built-in native tools: read_file/write_file/patch/edit_file/undo (per-session
+    // stateful), bash + process, todo, webfetch + web_search.
+    this.fileTools = registerAgentTools(this.skillRegistry, { files: { logger: this.logger } }).fileTools;
 
     // send_message skill
     const sendMessageSkill = defineSkill('send_message', 'Send a text message to the user immediately. Use this for conversational, human-like messaging.')
@@ -1172,12 +1409,7 @@ export class Gateway {
         if (!ctx.userId) {
           return { success: false, output: 'Cannot send message - user ID not available' };
         }
-        const ok = await this.handleMessageSend(
-          ctx.userId,
-          message.trim(),
-          ctx.sessionId,
-          ctx.userMessage,
-        );
+        const ok = await this.handleMessageSend(ctx.userId, message.trim());
         return ok
           ? { success: true, output: 'Message sent' }
           : { success: false, output: 'Failed to send message - check logs for details' };
@@ -1452,213 +1684,39 @@ export class Gateway {
       .build();
     this.skillRegistry.registerSkill(memoryGetSkill.skill);
 
+    // session_search: FTS5/BM25 recall over the caller's own transcripts,
+    // including turns that lean compaction removed from the context.
+    if (this.scallopMemoryStore) {
+      registerSessionSearchTool(this.skillRegistry, {
+        db: this.scallopMemoryStore.getDatabase(),
+        canonicalSingleUserIds: () => this.canonicalSingleUserIds,
+      });
+    }
+
     // Safe on-demand access to documentation-only (including learned) skills.
     // Explicit selection is the usage signal that drives curator decisions.
     this.skillRegistry.registerSkill(createLoadProcedureSkill(
       this.skillRegistry,
-      name => this.evolutionEngine?.recordSkillUse(name),
+      name => this.learning?.curator.recordSkillUse(name),
     ));
+
+    // Core memory (`memory` tool) + verified/versioned skill authoring (`skill_manage`).
+    this.learning?.registerTools();
   }
 
   /**
-   * Register spawn_agent and check_agents native skills for sub-agent system
+   * Register spawn_agent, check_agents and progress_note (src/subagent/tools.ts).
    */
   private registerSubAgentSkills(): void {
-    if (!this.skillRegistry || !this.subAgentRegistry || !this.subAgentExecutor) return;
-
-    const registry = this.subAgentRegistry;
-    const executor = this.subAgentExecutor;
-    const logger = this.logger;
-
-    // spawn_agent skill
-    const spawnAgentSkill = defineSkill(
-      'spawn_agent',
-      'Delegate one task or an atomic parallel batch to durable focused workers. Supports explicit context, acceptance criteria, isolated/forked context, bounded orchestrators, and isolated Git worktrees.'
-    )
-      .userInvocable(false)
-      .inputSchema({
-        type: 'object',
-        properties: {
-          task: { type: 'string', description: 'Clear description of what the sub-agent should accomplish' },
-          tasks: {
-            type: 'array',
-            description: 'Atomic fan-out batch. All capacity is checked before any child starts.',
-            items: {
-              type: 'object',
-              properties: {
-                task: { type: 'string' },
-                label: { type: 'string' },
-                context: { type: 'string' },
-                acceptance_criteria: { type: 'array', items: { type: 'string' } },
-                skills: { type: 'string' },
-              },
-              required: ['task'],
-            },
-          },
-          label: { type: 'string', description: 'Short label for tracking (e.g., "weather-check")' },
-          context: { type: 'string', description: 'Task-specific facts/context, kept separate from the instruction' },
-          acceptance_criteria: { type: 'array', items: { type: 'string' }, description: 'Concrete conditions that must pass before success' },
-          skills: { type: 'string', description: 'Comma-separated skill names to request. Empty uses read-only defaults (read_file, memory_search); every request is still filtered by parent tool policy.' },
-          model_tier: { type: 'string', description: 'fast (default/cheapest), standard, or capable' },
-          context_mode: { type: 'string', description: 'isolated, brief (default), or fork' },
-          role: { type: 'string', description: 'leaf (default) or bounded orchestrator' },
-          workspace_mode: { type: 'string', description: 'shared (default) or worktree for coding isolation' },
-          workflow: { type: 'string', description: 'Set to coding for isolated implement -> independent review/test -> conflict-checked patch' },
-          timeout_seconds: { type: 'number', description: 'Optional hard wall-clock limit; 0/default means progress-aware idle timeout only' },
-          idle_timeout_seconds: { type: 'number', description: 'Stop only after this many seconds with no model/tool progress' },
-          wait: { type: 'boolean', description: 'Wait for result inline (default: false = async)' },
-        },
-        required: [],
-      })
-      .onNativeExecute(async (ctx) => {
-        const task = ctx.args.task as string | undefined;
-        const batch = Array.isArray(ctx.args.tasks) ? ctx.args.tasks as Array<Record<string, unknown>> : [];
-        if ((!task || task.trim().length < 5) && batch.length === 0) {
-          return { success: false, output: '', error: 'Provide task or a non-empty tasks batch' };
-        }
-
-        const skillsStr = ctx.args.skills as string | undefined;
-        const skills = skillsStr ? skillsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
-        const modelTier = (ctx.args.model_tier as 'fast' | 'standard' | 'capable') || undefined;
-        const timeoutSeconds = ctx.args.timeout_seconds as number | undefined;
-        const idleTimeoutSeconds = ctx.args.idle_timeout_seconds as number | undefined;
-        const wait = ctx.args.wait as boolean | undefined;
-
-        // Check concurrency
-        const session = await this.sessionManager!.getSession(ctx.sessionId);
-        const canSpawn = registry.canSpawn(ctx.sessionId, session?.metadata as Record<string, unknown> | undefined, batch.length || 1);
-        if (!canSpawn.allowed) {
-          return { success: false, output: '', error: canSpawn.reason || 'Cannot spawn sub-agent' };
-        }
-
-        const common = {
-          label: (ctx.args.label as string) || undefined,
-          skills,
-          modelTier,
-          timeoutSeconds,
-          idleTimeoutSeconds,
-          context: (ctx.args.context as string) || undefined,
-          acceptanceCriteria: Array.isArray(ctx.args.acceptance_criteria) ? ctx.args.acceptance_criteria as string[] : undefined,
-          contextMode: ctx.args.context_mode as 'isolated' | 'brief' | 'fork' | undefined,
-          role: ctx.args.role as 'leaf' | 'orchestrator' | undefined,
-          workspaceMode: ctx.args.workspace_mode as 'shared' | 'worktree' | undefined,
-          waitForResult: wait,
-        };
-        const input = { ...common, task: task?.trim() || '' };
-
-        try {
-          if (ctx.args.workflow === 'coding') {
-            if (!task || task.trim().length < 5) throw new Error('Coding workflow requires a task description');
-            const result = await executor.runCodingWorkflow(ctx.sessionId, { ...input, workspaceMode: 'worktree' });
-            return { success: result.status === 'succeeded', output: JSON.stringify(result), ...(result.status === 'succeeded' ? {} : { error: result.blockers.join('; ') || 'Coding workflow blocked' }) };
-          }
-          if (batch.length > 0) {
-            const inputs = batch.map(item => ({
-              ...common,
-              task: String(item.task || '').trim(),
-              label: typeof item.label === 'string' ? item.label : undefined,
-              context: typeof item.context === 'string' ? item.context : undefined,
-              acceptanceCriteria: Array.isArray(item.acceptance_criteria) ? item.acceptance_criteria as string[] : common.acceptanceCriteria,
-              skills: typeof item.skills === 'string' ? item.skills.split(',').map(value => value.trim()).filter(Boolean) : common.skills,
-            }));
-            if (inputs.some(item => item.task.length < 5)) throw new Error('Every batch task must be at least 5 characters');
-            const runs = await executor.spawnBatch(ctx.sessionId, inputs);
-            return { success: true, output: `${runs.length} sub-agents started atomically: ${runs.map(run => run.runId).join(', ')}` };
-          }
-          if (wait) {
-            // Synchronous: block until result
-            const result = await executor.spawnAndWait(ctx.sessionId, input);
-            return {
-              success: true,
-              output: result.response,
-            };
-          } else {
-            // Asynchronous: return immediately
-            const { runId } = await executor.spawn(ctx.sessionId, input);
-            return {
-              success: true,
-              output: `Sub-agent "${input.label || runId.slice(0, 8)}" spawned (run: ${runId}). Results will appear when complete.`,
-            };
-          }
-        } catch (error) {
-          logger.error({ error: (error as Error).message, task }, 'spawn_agent failed');
-          return { success: false, output: '', error: `Failed to spawn sub-agent: ${(error as Error).message}` };
-        }
-      })
-      .build();
-    this.skillRegistry.registerSkill(spawnAgentSkill.skill);
-
-    // check_agents skill
-    const checkAgentsSkill = defineSkill(
-      'check_agents',
-      'Inspect or control delegated work: list, info, log, cancel, steer a running child, or start a follow-up.'
-    )
-      .userInvocable(false)
-      .inputSchema({
-        type: 'object',
-        properties: {
-          action: { type: 'string', description: 'list (default), info, log, cancel, steer, or followup' },
-          run_id: { type: 'string', description: 'Run id for all actions except list' },
-          message: { type: 'string', description: 'Steering/follow-up instruction' },
-          wait: { type: 'boolean', description: 'Wait inline for a follow-up result' },
-        },
-        required: [],
-      })
-      .onNativeExecute(async (ctx) => {
-        const runs = registry.getRunsForParent(ctx.sessionId);
-        const action = String(ctx.args.action || 'list');
-        if (action !== 'list') {
-          const runId = String(ctx.args.run_id || '');
-          const run = runs.find(candidate => candidate.id === runId);
-          if (!run) return { success: false, output: '', error: 'Unknown run for this parent session' };
-          if (action === 'info') return { success: true, output: JSON.stringify(run.result ?? run, null, 2) };
-          if (action === 'log') {
-            const log = await executor.getRunLog(runId);
-            return { success: true, output: log.map(entry => `${entry.role}: ${entry.content}`).join('\n\n') || 'No retained log.' };
-          }
-          if (action === 'cancel') {
-            const applied = executor.cancel(runId);
-            return applied ? { success: true, output: `Cancelled ${run.label}.` } : { success: false, output: '', error: 'Run is not active' };
-          }
-          if (action === 'steer') {
-            const applied = executor.steer(runId, String(ctx.args.message || ''));
-            return applied ? { success: true, output: `Steering update queued for ${run.label}.` } : { success: false, output: '', error: 'Run is not active or message is empty' };
-          }
-          if (action === 'followup' && String(ctx.args.message || '').trim()) {
-            const result = await executor.followUp(ctx.sessionId, runId, String(ctx.args.message), Boolean(ctx.args.wait));
-            return { success: true, output: 'response' in result ? result.response : `Follow-up spawned: ${result.runId}` };
-          }
-          return { success: false, output: '', error: 'Unknown action or missing message' };
-        }
-        if (runs.length === 0) {
-          return { success: true, output: 'No sub-agents found for this session.' };
-        }
-
-        const lines: string[] = [];
-        for (const run of runs) {
-          const elapsed = run.startedAt
-            ? `${((Date.now() - run.startedAt) / 1000).toFixed(0)}s`
-            : 'not started';
-          let line = `- **${run.label}** [${run.status}] (${elapsed})`;
-          if (run.result) {
-            const snippet = run.result.response.length > 100
-              ? run.result.response.substring(0, 100) + '...'
-              : run.result.response;
-            line += `: ${snippet}`;
-          }
-          if (run.error) {
-            line += ` — Error: ${run.error}`;
-          }
-          lines.push(line);
-        }
-
-        return {
-          success: true,
-          output: `Sub-agents for this session (${runs.length}):\n${lines.join('\n')}`,
-        };
-      })
-      .build();
-    this.skillRegistry.registerSkill(checkAgentsSkill.skill);
+    if (!this.skillRegistry || !this.subAgentRegistry || !this.subAgentExecutor || !this.sessionManager) return;
+    for (const skill of createSubAgentSkills({
+      registry: this.subAgentRegistry,
+      executor: this.subAgentExecutor,
+      sessionManager: this.sessionManager,
+      logger: this.logger,
+    })) {
+      this.skillRegistry.registerSkill(skill);
+    }
   }
 
   /**
@@ -1749,6 +1807,51 @@ export class Gateway {
       })
       .build();
     this.skillRegistry.registerSkill(skill.skill);
+  }
+
+  /**
+   * Background bash exits become `[bash-done ...]` messages: steering into a
+   * running turn, or a new turn whose reply goes out through the outbound
+   * queue like any other proactive result.
+   */
+  private wireBashDoneNotices(): void {
+    if (this.bashDoneListener) backgroundProcesses.off('exit', this.bashDoneListener);
+    const lane = (sessionId: string) => `session:${sessionId}`;
+    const route = createBashDoneRouter({
+      isBusy: (sessionId) => laneIsBusy(lane(sessionId)),
+      enqueueSteering: (sessionId, text) => {
+        this.interruptQueue?.enqueue({ sessionId, text, timestamp: Date.now() });
+      },
+      waitForIdle: (sessionId) => enqueueInLane(lane(sessionId), async () => {}),
+      takeSteering: (sessionId, text) => {
+        if (!this.interruptQueue) return false;
+        const pending = this.interruptQueue.drain(sessionId);
+        const index = pending.findIndex(entry => entry.text === text);
+        pending.forEach((entry, i) => { if (i !== index) this.interruptQueue!.enqueue(entry); });
+        return index >= 0;
+      },
+      runTurn: async (sessionId, text) => {
+        if (!this.agent) return undefined;
+        return (await this.agent.processMessage(sessionId, text)).response;
+      },
+      deliver: async (userId, text, sessionId) => {
+        const handler = this.outboundQueue?.createHandler();
+        if (!handler) return this.handleProactiveMessage(userId, text);
+        return handler(userId, text, {
+          scheduledItemId: `bash-done:${sessionId}:${Date.now()}`,
+          ownerUserId: userId,
+          // The reply is the agent's own finished turn: deliver it as written.
+          outcome: { source: 'task_result', sessionId, explicitUserText: true, evidenceVerified: true },
+        });
+      },
+      isSubAgentSession: async (sessionId) => {
+        const session = await this.sessionManager?.getSession(sessionId);
+        return session?.metadata?.isSubAgent === true;
+      },
+      logger: this.logger,
+    });
+    this.bashDoneListener = (e) => { void route(e); };
+    backgroundProcesses.on('exit', this.bashDoneListener);
   }
 
   /**
@@ -1858,12 +1961,15 @@ export class Gateway {
   }
 
   /**
-   * Lease and deliver background child completions. Parent context receives a
-   * system-internal receipt; the user sees only a polished outcome sentence.
+   * Lease durable child completions and hand them to the session waker. An
+   * idle parent gets a new turn carrying `[agent-result: name] …` (it reacts
+   * and replies to the user); a busy parent receives the same text from the
+   * announce queue at its next iteration and the waker drops its copy.
+   * Children of sub-agents are resumed by the executor itself.
    */
   private async drainSubAgentDeliveries(): Promise<void> {
     const db = this.scallopMemoryStore?.getDatabase();
-    if (!db || !this.sessionManager) return;
+    if (!db || !this.sessionManager || !this.sessionWaker) return;
     const deliveries = db.claimSubAgentDeliveries(10, 30_000);
     for (const delivery of deliveries) {
       if (!delivery.leaseToken) continue;
@@ -1871,60 +1977,63 @@ export class Gateway {
         const payload = JSON.parse(delivery.payloadJson) as {
           runId: string;
           label: string;
-          result: {
-            status: string;
-            summary: string;
-            blockers?: string[];
-            nextActions?: string[];
-          };
+          kind?: string;
+          message?: string;
+          result?: { status?: string; summary?: string; blockers?: string[] };
         };
-        const parent = await this.sessionManager.getSession(delivery.parentSessionId);
-        const marker = `[Sub-agent result:${payload.runId}]`;
+        const parentId = delivery.parentSessionId;
+        const parent = await this.sessionManager.getSession(parentId);
+        const runFooter = `[run ${payload.runId}]`;
+        const legacyMarker = `[Sub-agent result:${payload.runId}]`;
         const alreadyInjected = parent?.messages.some(message =>
-          typeof message.content === 'string' && message.content.startsWith(marker),
+          typeof message.content === 'string'
+          && (message.content.includes(runFooter) || message.content.startsWith(legacyMarker)),
         );
-        if (parent && !alreadyInjected) {
-          await this.sessionManager.addMessage(delivery.parentSessionId, {
-            // Provider-role `user` is the protocol carrier for internal tool/
-            // worker results. The explicit marker makes the durable kind
-            // system_internal, so dashboards never mistake this for a public
-            // assistant reply.
-            role: 'user',
-            content: `${marker}\n${JSON.stringify(payload.result)}`,
+        if (parent && !parent.metadata?.isSubAgent && !alreadyInjected) {
+          const message = payload.message
+            ?? formatAgentResult(payload.label, [
+              payload.result?.summary ?? '',
+              ...(payload.result?.blockers ?? []).map(blocker => `Blocker: ${blocker}`),
+            ].join('\n'), { runId: payload.runId });
+          const announceQueue = this.announceQueue;
+          this.sessionWaker.wake(parentId, message, {
+            kind: payload.kind === 'agent-exited' ? 'agent-exited' : 'agent-result',
+            isPending: () => !announceQueue?.wasDrained(parentId, payload.runId),
+            claim: () => { announceQueue?.acknowledge(parentId, payload.runId); },
           });
-        }
-        this.announceQueue?.acknowledge(delivery.parentSessionId, delivery.runId);
-
-        if (delivery.userId) {
-          const succeeded = payload.result.status === 'succeeded';
-          const summary = payload.result.summary.trim().replace(/\s+/g, ' ');
-          const blocker = payload.result.blockers?.find(Boolean);
-          const message = succeeded
-            ? `${payload.label} is finished — ${summary}`
-            : `${payload.label} couldn't finish yet — ${blocker || summary}`;
-          const sent = await this.outboundQueue?.createHandler()(
-            delivery.userId,
-            message,
-            {
-              scheduledItemId: `subagent:${payload.runId}`,
-              ownerUserId: delivery.userId,
-              outcome: {
-                source: 'subagent_completion',
-                sessionId: delivery.parentSessionId,
-                activeRequest: payload.label,
-                evidenceVerified: true,
-              },
-            },
-          );
-          if (!sent || (!messageWasDelivered(sent) && !isMessageDeliverySuppressed(sent))) {
-            throw new Error('No channel confirmed delivery');
-          }
         }
         db.completeSubAgentDelivery(delivery.runId, delivery.leaseToken);
       } catch (error) {
         db.failSubAgentDelivery(delivery.runId, delivery.leaseToken, (error as Error).message);
         this.logger.warn({ runId: delivery.runId, error: (error as Error).message }, 'Sub-agent delivery deferred');
       }
+    }
+  }
+
+  /**
+   * Start a parent turn for harness messages (agent results, background bash)
+   * while the session is idle. Returns 'started', 'queued' (busy: retried when
+   * idle unless the running turn consumes it first) or 'unavailable'.
+   */
+  onIdleWake(sessionId: string, message: string, opts: WakeOptions = { kind: 'wake' }): WakeOutcome | 'unavailable' {
+    return this.sessionWaker ? this.sessionWaker.wake(sessionId, message, opts) : 'unavailable';
+  }
+
+  /** One wake turn: run the parent agent and deliver its reply to the user's channel. */
+  private async runWakeTurn(request: WakeTurnRequest): Promise<void> {
+    if (!this.agent || !this.sessionManager) return;
+    const session = await this.sessionManager.getSession(request.sessionId);
+    if (!session) return;
+    // Progress notes that piled up while idle are stale once the result is here.
+    this.announceQueue?.dropProgress(request.sessionId);
+    this.logger.info({ sessionId: request.sessionId, kinds: request.kinds }, 'Waking idle session');
+    const result = await this.agent.processMessage(request.sessionId, request.message);
+    const reply = result.response?.trim();
+    const userId = typeof session.metadata?.userId === 'string' ? session.metadata.userId : undefined;
+    if (!reply || !userId) return;
+    const sent = await this.handleProactiveMessage(userId, reply);
+    if (!sent || (!messageWasDelivered(sent) && !isMessageDeliverySuppressed(sent))) {
+      this.logger.warn({ sessionId: request.sessionId }, 'Wake turn reply was not delivered');
     }
   }
 
@@ -1991,25 +2100,12 @@ export class Gateway {
    * This allows the agent to send multiple messages during its execution loop
    * Uses trigger source abstraction for multi-channel support
    */
-  private async handleMessageSend(
-    userId: string,
-    message: string,
-    sessionId?: string,
-    activeRequest?: string,
-  ): Promise<boolean> {
+  private async handleMessageSend(userId: string, message: string): Promise<boolean> {
     this.logger.debug({ userId, messageLength: message.length }, 'Sending message to user');
 
-    if (this.outcomeBrain) {
-      const decision = await this.outcomeBrain.decideMessage({
-        source: 'progress',
-        userId,
-        sessionId,
-        messages: [message],
-        activeRequest,
-      });
-      if (decision.decision !== 'send' || !decision.message) return false;
-      message = decision.message;
-    }
+    // Progress updates go out as the model wrote them, minus private reasoning.
+    message = stripThinkTags(message).trim();
+    if (!message) return false;
 
     const { source: triggerSource, rawUserId } = this.resolveTriggerSource(userId);
 

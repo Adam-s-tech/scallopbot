@@ -36,6 +36,13 @@ import type { ScallopDatabase, SessionMessageRow } from '../memory/db.js';
 import { AuthService } from './auth.js';
 import { nanoid } from 'nanoid';
 import type { InterruptQueue } from '../agent/interrupt-queue.js';
+import {
+  GOAL_HELP,
+  formatGoalOutcome,
+  formatGoalStatus,
+  parseGoalCommand,
+  type GoalModeController,
+} from '../goals/goal-mode.js';
 import type { BotConfigManager } from './bot-config.js';
 import type { ProviderRegistry } from '../providers/registry.js';
 import type { SubAgentRegistry, SubAgentExecutor } from '../subagent/index.js';
@@ -163,6 +170,8 @@ export interface ApiChannelConfig {
   db?: ScallopDatabase;
   /** Interrupt queue for mid-loop user message injection */
   interruptQueue?: InterruptQueue;
+  /** Goal mode controller for /goal (shared with other channels). */
+  goalMode?: GoalModeController;
   /** Callback when a WebSocket user sends a message (for engagement tracking) */
   onUserMessage?: (prefixedUserId: string, userMessage?: string) => void;
   /** Bot config manager for /settings and /model commands (optional) */
@@ -247,7 +256,7 @@ interface WsMessage {
 }
 
 interface WsResponse {
-  type: 'response' | 'chunk' | 'error' | 'pong' | 'trigger' | 'file' | 'skill_start' | 'skill_complete' | 'skill_error' | 'thinking' | 'planning' | 'debug' | 'memory' | 'proactive';
+  type: 'response' | 'chunk' | 'chunk_reset' | 'error' | 'pong' | 'trigger' | 'file' | 'skill_start' | 'skill_complete' | 'skill_error' | 'thinking' | 'planning' | 'debug' | 'memory' | 'proactive';
   sessionId?: string;
   content?: string;
   error?: string;
@@ -279,7 +288,7 @@ interface WsResponse {
 export class ApiChannel implements Channel, TriggerSource {
   name = 'api';
 
-  private config: Required<Omit<ApiChannelConfig, 'apiKey' | 'allowedOrigins' | 'staticDir' | 'costTracker' | 'memoryStore' | 'db' | 'interruptQueue' | 'onUserMessage' | 'configManager' | 'providerRegistry' | 'subAgentRegistry' | 'subAgentExecutor' | 'twilioWebhook' | 'voiceManager'>> & {
+  private config: Required<Omit<ApiChannelConfig, 'apiKey' | 'allowedOrigins' | 'staticDir' | 'costTracker' | 'memoryStore' | 'db' | 'interruptQueue' | 'onUserMessage' | 'configManager' | 'providerRegistry' | 'subAgentRegistry' | 'subAgentExecutor' | 'twilioWebhook' | 'voiceManager' | 'goalMode'>> & {
     apiKey?: string;
     allowedOrigins: string[];
     staticDir?: string;
@@ -307,6 +316,7 @@ export class ApiChannel implements Channel, TriggerSource {
   private subAgentExecutor: SubAgentExecutor | null = null;
   private twilioWebhook: TwilioWebhookHandler | null = null;
   private voiceManager: VoiceManager | null = null;
+  private goalMode: GoalModeController | null = null;
   /** Per-client verbose mode toggle */
   private verboseClients: Set<string> = new Set();
 
@@ -326,6 +336,7 @@ export class ApiChannel implements Channel, TriggerSource {
     };
     this.logger = config.logger.child({ channel: 'api' });
     this.interruptQueue = config.interruptQueue || null;
+    this.goalMode = config.goalMode ?? null;
     this.onUserMessage = config.onUserMessage;
     if (config.db) {
       this.authService = new AuthService(config.db);
@@ -884,9 +895,21 @@ export class ApiChannel implements Channel, TriggerSource {
         });
       }
 
-      // Note: For now, we send the full response as a single event
-      // In the future, this could be modified to stream tokens
-      const result = await this.config.agent.processMessage(sessionId, body.message);
+      // Reply text streams as `delta` events; `reset` means discard the
+      // text streamed so far (it was planning beside a tool call). The final
+      // reply still arrives as one `message` event.
+      const result = await this.config.agent.processMessage(
+        sessionId,
+        body.message,
+        undefined,
+        async (update) => {
+          if (update.type === 'text_delta') {
+            res.write(`event: delta\ndata: ${JSON.stringify({ sessionId, content: update.message })}\n\n`);
+          } else if (update.type === 'text_reset') {
+            res.write(`event: reset\ndata: ${JSON.stringify({ sessionId })}\n\n`);
+          }
+        },
+      );
 
       // Send response event
       res.write(`event: message\n`);
@@ -1492,6 +1515,67 @@ export class ApiChannel implements Channel, TriggerSource {
   }
 
   /**
+   * /goal on the web UI. Every turn's reply is shown as it lands (the UI is
+   * built for a stream of replies), then the final report. The run holds the
+   * client's processing slot so new messages steer it via the interrupt queue.
+   */
+  private async handleGoalCommand(ws: WebSocket, clientId: string, args: string): Promise<void> {
+    const goalMode = this.goalMode;
+    if (!goalMode) {
+      this.sendWsMessage(ws, { type: 'response', content: 'Goal mode is not available.' });
+      return;
+    }
+    const sessionId = await this.getOrCreateSession('default');
+    const command = parseGoalCommand(args);
+    if (command.action === 'help') {
+      this.sendWsMessage(ws, { type: 'response', content: GOAL_HELP });
+      return;
+    }
+    if (command.action === 'status') {
+      this.sendWsMessage(ws, { type: 'response', content: formatGoalStatus(goalMode.status(sessionId)) });
+      return;
+    }
+    if (command.action === 'stop') {
+      const stopped = goalMode.stop(sessionId);
+      this.sendWsMessage(ws, { type: 'response', content: stopped ? 'Stopping the goal…' : 'No goal is running.' });
+      return;
+    }
+    if (goalMode.isRunning(sessionId) || this.activeProcessing.has(clientId)) {
+      this.sendWsMessage(ws, {
+        type: 'response',
+        content: goalMode.isRunning(sessionId)
+          ? formatGoalStatus(goalMode.status(sessionId))
+          : 'Still working on your last message. Stop it or wait, then start the goal.',
+      });
+      return;
+    }
+
+    this.activeProcessing.add(clientId);
+    this.stopRequests.delete(clientId);
+    this.sendWsMessage(ws, { type: 'response', sessionId, content: `Goal started: ${command.objective}` });
+    // Not awaited: the socket keeps handling /stop and steering messages.
+    void goalMode
+      .run(sessionId, command.objective, {
+        userId: 'api:default',
+        shouldStop: () => this.stopRequests.has(clientId),
+        onTurn: (_run, response) => {
+          this.sendWsMessage(ws, { type: 'response', sessionId, content: safeAssistantResponse(response) });
+        },
+      })
+      .then((run) => {
+        this.sendWsMessage(ws, { type: 'response', sessionId, content: safeAssistantResponse(formatGoalOutcome(run)) });
+      })
+      .catch((error: Error) => {
+        this.logger.error({ clientId, error: error.message }, 'Goal run failed');
+        this.sendWsMessage(ws, { type: 'error', error: 'Goal run failed' });
+      })
+      .finally(() => {
+        this.stopRequests.delete(clientId);
+        this.activeProcessing.delete(clientId);
+      });
+  }
+
+  /**
    * Handle built-in slash commands from WebSocket clients.
    * Returns true if the command was handled (caller should not forward to agent).
    */
@@ -1528,7 +1612,8 @@ export class ApiChannel implements Channel, TriggerSource {
           '/model — Switch AI model/provider\n' +
           '/usage — View token usage and costs\n' +
           '/settings — View your configuration\n' +
-          '/verbose — Toggle debug output\n\n' +
+          '/verbose — Toggle debug output\n' +
+          '/goal `<objective>` — Keep working until the objective is verified\n\n' +
           '**Skills:**\n' +
           '/memory\\_search `<query>` — Search long-term memory\n' +
           '/goals `<action>` — Manage goals, milestones, and tasks\n' +
@@ -1538,12 +1623,19 @@ export class ApiChannel implements Channel, TriggerSource {
         return true;
       }
 
+      case 'goal': {
+        await this.handleGoalCommand(ws, clientId, args);
+        return true;
+      }
+
       case 'stop': {
         this.stopRequests.add(clientId);
         if (this.interruptQueue) {
           const sessionId = this.userSessions.get('default');
           if (sessionId) this.interruptQueue.clear(sessionId);
         }
+        const goalSessionId = this.userSessions.get('default');
+        if (goalSessionId) this.goalMode?.stop(goalSessionId);
         const wasActive = this.activeProcessing.has(clientId);
         if (wasActive) {
           this.sendWsMessage(ws, { type: 'response', content: 'Stopping current task...' });
@@ -1766,10 +1858,20 @@ export class ApiChannel implements Channel, TriggerSource {
 
         this.activeProcessing.add(clientId);
         try {
+          // Reply text streams to every client ('chunk', 'chunk_reset').
           // Internal progress is opt-in. Reasoning text itself is never sent,
           // even in verbose mode; verbose clients receive a lifecycle summary.
-          const onProgress = this.verboseClients.has(clientId)
-            ? async (update: { type: string; message: string; toolName?: string; iteration?: number; count?: number; action?: string; items?: { type: string; content: string; subject?: string }[] }) => {
+          const verbose = this.verboseClients.has(clientId);
+          const onProgress = async (update: { type: string; message: string; toolName?: string; iteration?: number; count?: number; action?: string; items?: { type: string; content: string; subject?: string }[] }) => {
+                if (update.type === 'text_delta') {
+                  this.sendWsMessage(ws, { type: 'chunk', sessionId, content: update.message });
+                  return;
+                }
+                if (update.type === 'text_reset') {
+                  this.sendWsMessage(ws, { type: 'chunk_reset', sessionId });
+                  return;
+                }
+                if (!verbose) return;
                 if (update.type === 'tool_start') {
                   this.sendWsMessage(ws, {
                     type: 'skill_start',
@@ -1816,8 +1918,7 @@ export class ApiChannel implements Channel, TriggerSource {
                     message: safeDebugText(update.message)
                   });
                 }
-              }
-            : undefined;
+              };
 
           // Convert WebSocket attachments to agent Attachment format
           let attachments: Attachment[] | undefined;

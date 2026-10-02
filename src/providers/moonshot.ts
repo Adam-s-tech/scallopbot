@@ -20,10 +20,35 @@ import type {
   CompletionRequest,
   CompletionResponse,
   ContentBlock,
+  StreamHandlers,
   ToolResultContent,
 } from './types.js';
 import { flattenSystem } from './types.js';
+import {
+  ChatCompletionStreamAssembler,
+  StreamInterruptedError,
+  trackingHandlers,
+  type ChatCompletionChunkLike,
+} from './streaming.js';
 import { DEFAULT_MAX_RETRIES, RETRY_STATUS_CODES, RETRY_DELAY_MS } from './constants.js';
+
+/**
+ * Kimi ids Moonshot no longer serves (404 "Not found the model" since late
+ * Sep 2026), mapped to their direct successor so an old .env keeps working.
+ */
+const RETIRED_MOONSHOT_MODELS: Record<string, string> = {
+  'kimi-k2.5': 'kimi-k2.6',
+  'kimi-k2.5-thinking': 'kimi-k2.6',
+  'kimi-k2-0905': 'kimi-k2.6',
+  'kimi-k2-thinking': 'kimi-k2.6',
+};
+
+export function resolveMoonshotModel(model: string, logger?: { warn: (obj: object, msg: string) => void }): string {
+  const replacement = RETIRED_MOONSHOT_MODELS[model];
+  if (!replacement) return model;
+  logger?.warn({ configured: model, using: replacement }, 'Moonshot model is retired; using its successor');
+  return replacement;
+}
 
 /**
  * Moonshot/Kimi Model IDs
@@ -40,10 +65,11 @@ export const MOONSHOT_MODELS = {
   'moonshot-v1-32k': 'moonshot-v1-32k',
   'moonshot-v1-8k': 'moonshot-v1-8k',
   // Aliases
-  'kimi': 'kimi-k2.5',
+  'kimi': 'kimi-k3',
+  'kimi-k3': 'kimi-k3',
 } as const;
 
-const DEFAULT_MODEL = 'kimi-k2.5';
+const DEFAULT_MODEL = 'kimi-k3';
 const DEFAULT_BASE_URL = 'https://api.moonshot.ai/v1';
 const DEFAULT_MAX_TOKENS = 4096;
 /** Higher token budget for thinking mode — reasoning tokens count against max_tokens */
@@ -76,7 +102,7 @@ export class MoonshotProvider implements LLMProvider {
     this.logger = logger;
     // Support both single apiKey and multiple apiKeys
     this.apiKeys = options.apiKeys?.length ? options.apiKeys : [options.apiKey];
-    this.model = options.model || DEFAULT_MODEL;
+    this.model = resolveMoonshotModel(options.model || DEFAULT_MODEL, logger);
     this.maxRetries = options.maxRetries || DEFAULT_MAX_RETRIES;
     this.baseUrl = options.baseUrl || DEFAULT_BASE_URL;
     this.timeout = options.timeout;
@@ -112,8 +138,13 @@ export class MoonshotProvider implements LLMProvider {
     return this.currentKeyIndex !== 0; // true if we haven't cycled back to start
   }
 
-  async complete(request: CompletionRequest): Promise<CompletionResponse> {
-    const isKimiK2 = this.model.includes('kimi-k2');
+  /** The request params shared by complete() and completeStream(). */
+  private buildParams(request: CompletionRequest): {
+    params: OpenAI.ChatCompletionCreateParamsNonStreaming & { thinking?: { type: string } };
+    messages: OpenAI.ChatCompletionMessageParam[];
+  } {
+    // K2 and later accept the same `thinking` toggle.
+    const isKimiK2 = /kimi-k[2-9]/.test(this.model);
     // Enable thinking mode if explicitly requested AND model supports it
     const enableThinking = request.enableThinking === true && isKimiK2;
 
@@ -138,7 +169,7 @@ export class MoonshotProvider implements LLMProvider {
     const effectiveMaxTokens = request.thinkingBudgetTokens && enableThinking
       ? Math.max(request.thinkingBudgetTokens, defaultTokens)
       : (request.maxTokens || defaultTokens);
-    const params: OpenAI.ChatCompletionCreateParams & { thinking?: { type: string } } = {
+    const params: OpenAI.ChatCompletionCreateParamsNonStreaming & { thinking?: { type: string } } = {
       model: this.model,
       messages,
       max_tokens: effectiveMaxTokens,
@@ -153,6 +184,11 @@ export class MoonshotProvider implements LLMProvider {
       // Only disable thinking if NOT enabling it (for Kimi K2 models)
       ...(isKimiK2 && !enableThinking && { thinking: { type: 'disabled' } }),
     };
+    return { params, messages };
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    const { params, messages } = this.buildParams(request);
 
     // Debug logging - log the full request
     this.logger?.debug({
@@ -195,6 +231,47 @@ export class MoonshotProvider implements LLMProvider {
       }, 'Error');
       throw error;
     }
+  }
+
+  /**
+   * Streamed completion: complete()'s params plus `stream: true`. Kimi sends
+   * reasoning as `reasoning_content` deltas (kept as a thinking block, like
+   * complete()) and usage on the final chunk's choice. Retries and key
+   * rotation apply only until the first visible delta.
+   */
+  async completeStream(request: CompletionRequest, handlers: StreamHandlers): Promise<CompletionResponse> {
+    const { params } = this.buildParams(request);
+    const streamParams = {
+      ...params,
+      stream: true,
+      stream_options: { include_usage: true },
+    } as OpenAI.ChatCompletionCreateParamsStreaming & { thinking?: { type: string } };
+    const tracked = trackingHandlers(handlers);
+
+    const completion = await this.executeWithRetry(async () => {
+      const assembler = new ChatCompletionStreamAssembler(tracked.handlers, { keepReasoning: true });
+      try {
+        const stream = request.signal
+          ? await this.client.chat.completions.create(streamParams, { signal: request.signal })
+          : await this.client.chat.completions.create(streamParams);
+        for await (const chunk of stream) {
+          assembler.push(chunk as ChatCompletionChunkLike);
+        }
+      } catch (error) {
+        if (tracked.delivered()) throw new StreamInterruptedError(error);
+        throw error;
+      }
+      return assembler.result();
+    });
+
+    this.logger?.debug({
+      model: completion.model,
+      finishReason: completion.choices[0]?.finish_reason,
+      toolCallCount: completion.choices[0]?.message.tool_calls?.length || 0,
+      usage: completion.usage,
+    }, 'Stream response');
+
+    return this.formatResponse(completion as unknown as OpenAI.ChatCompletion);
   }
 
   private formatMessages(
@@ -442,8 +519,11 @@ export class MoonshotProvider implements LLMProvider {
     // Extract reasoning tokens from completion_tokens_details if available
     const usage = response.usage as typeof response.usage & {
       completion_tokens_details?: { reasoning_tokens?: number };
+      /** Kimi reports automatic context-cache hits at the top level. */
+      cached_tokens?: number;
     };
     const reasoningTokens = usage?.completion_tokens_details?.reasoning_tokens;
+    const cachedInputTokens = usage?.cached_tokens ?? usage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content,
@@ -451,6 +531,7 @@ export class MoonshotProvider implements LLMProvider {
       usage: {
         inputTokens: response.usage?.prompt_tokens || 0,
         outputTokens: response.usage?.completion_tokens || 0,
+        ...(cachedInputTokens ? { cachedInputTokens } : {}),
         ...(reasoningTokens !== undefined && { reasoningTokens }),
       },
       model: response.model,
