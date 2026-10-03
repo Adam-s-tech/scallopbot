@@ -11,6 +11,8 @@ import { registerTodoTool } from './todo/index.js';
 import { registerWebTools } from './web/index.js';
 import { persistLargeOutput } from './tool-output.js';
 import { verifyOnStopNudge } from './verify/ledger.js';
+import { reviewOnStop, reviewNote } from './review/review.js';
+import { checkOnStop } from './review/check.js';
 
 /** Register every built-in native tool; returns the stateful file tools. */
 export function registerAgentTools(
@@ -24,11 +26,27 @@ export function registerAgentTools(
   return { fileTools };
 }
 
-/** Hooks the core tools contribute: large-output persistence and the verify nudge. */
-export function coreToolHooks(options: { workspace: string; contextWindowTokens?: number }): AgentHooks {
+/**
+ * Hooks the core tools contribute: large-output persistence, the verify nudge
+ * and the second look before a turn that changed files ends. REVIEW_ON_STOP:
+ * `run` (default) = check-on-stop, a fresh-context reviewer that may run
+ * probes on a throwaway copy; `read` = read-only review; `false`/`off` = none.
+ * On ScallopBench v2 (kimi-k2.6, 108 task-runs) check-on-stop moved the pass
+ * rate from 105 to 106 and hard tasks from 43/45 to 44/45.
+ */
+export function coreToolHooks(options: { workspace: string; contextWindowTokens?: number; review?: 'read' | 'run' | false }): AgentHooks {
+  const setting = (process.env.REVIEW_ON_STOP ?? 'run').toLowerCase();
+  const review = options.review ?? (setting === 'read' ? 'read' : setting === 'false' || setting === 'off' ? false : 'run');
   return {
     postProcessToolResult: ({ sessionId, toolName, content }) =>
       persistLargeOutput(sessionId, toolName, content, { contextWindowTokens: options.contextWindowTokens }),
     verifyOnStop: (sessionId) => verifyOnStopNudge(sessionId, { workspace: options.workspace }),
+    ...(review ? {
+      reviewOnStop: async ({ sessionId, ...input }) => {
+        const run = review === 'run' ? checkOnStop : reviewOnStop;
+        const findings = await run({ ...input, workspace: options.workspace, traceSessionId: sessionId });
+        return findings ? reviewNote(findings) : null;
+      },
+    } : {}),
   };
 }

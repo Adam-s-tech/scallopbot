@@ -18,7 +18,7 @@ import { calculateBM25Score, buildDocFreqMap } from '../memory/bm25.js';
 
 export type ModeSearchFn = (query: string, limit: number) => Promise<ScallopSearchResult[]>;
 
-export type EvalModeName = 'openclaw' | 'mem0' | 'scallopbot' | 'scallopbot-tuned';
+export type EvalModeName = 'openclaw' | 'mem0' | 'scallopbot' | 'scallopbot-no-rerank' | 'scallopbot-tuned';
 
 export interface EvalModeConfig {
   name: EvalModeName;
@@ -97,8 +97,9 @@ export const MEM0_MODE: EvalModeConfig = {
 };
 
 /**
- * ScallopBot mode: everything enabled.
- * Complete cognitive architecture with hybrid retrieval, decay, and LLM reranking.
+ * ScallopBot mode, as shipped: hybrid retrieval, decay, the sleep-cycle
+ * pipeline (fusion, dreams, reflection) and time-limited LLM reranking
+ * (MEMORY_FOREGROUND_RERANK, on by default).
  */
 export const SCALLOPBOT_MODE: EvalModeConfig = {
   name: 'scallopbot',
@@ -115,6 +116,14 @@ export const SCALLOPBOT_MODE: EvalModeConfig = {
   decayOverrides: {
     categoryDecayRates: EVAL_CATEGORY_DECAY_RATES,
   },
+};
+
+/** ScallopBot with reranking turned off (MEMORY_FOREGROUND_RERANK=false). */
+export const SCALLOPBOT_NO_RERANK_MODE: EvalModeConfig = {
+  ...SCALLOPBOT_MODE,
+  name: 'scallopbot-no-rerank',
+  label: 'ScallopBot, no rerank',
+  enableReranking: false,
 };
 
 /**
